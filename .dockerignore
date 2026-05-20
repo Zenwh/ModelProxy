@@ -1,0 +1,35 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# 构建产物 / 缓存
+node_modules
+dist
+build
+.cache
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.vscode
+.idea
+*.swp
+*.swo
+
+# 日志 / 临时文件
+*.log
+tmp/
+temp/
+
+# Docker 自身的文件不需要再被 COPY 进容器
+docker-compose.yml
+docker-compose.*.yml
+.dockerignore
+Dockerfile
+
+# 截图和临时验证文件
+/tmp/
+snapshots/

@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.venv-*/
+venv/
+env/
+
+# 临时 / 日志
+*.log
+*.bak
+*.swp
+*.tmp
+*~
+
+# macOS / 编辑器
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# 运行时状态（含 user_access_token 和 api_keys，绝不能提交）
+.feishu_outside_caller/
+~/.feishu_outside_caller/
+
+# 部署相关凭据
+*.pem
+*.key
+.env
+.env.local
+
+# Demo / PRD（暂不入库）
+PRD/
+demo/
+
+# 资源切分方案（独立文档，不入库）
+资源池切分方案.md
