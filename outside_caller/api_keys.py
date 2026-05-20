@@ -27,6 +27,8 @@ class KeyInfo:
     created_at: str
     enabled: bool = True
     is_admin: bool = False
+    rpm_limit: Optional[int] = None             # 每分钟请求数；None = unlimited
+    daily_token_limit: Optional[int] = None     # 每日 token 上限；None = unlimited
 
 
 class APIKeyManager:
@@ -65,6 +67,8 @@ class APIKeyManager:
                 created_at=item.get("created_at", ""),
                 enabled=item.get("enabled", True),
                 is_admin=item.get("is_admin", False),
+                rpm_limit=item.get("rpm_limit"),
+                daily_token_limit=item.get("daily_token_limit"),
             )
             self._keys[info.key] = info
 
@@ -124,6 +128,38 @@ class APIKeyManager:
             info.enabled = True
             self._save()
             logger.info("启用 key: name=%s", info.name)
+            return True
+
+    def set_limits(
+        self,
+        key: str,
+        rpm_limit: Optional[int] = None,
+        daily_token_limit: Optional[int] = None,
+        clear_rpm: bool = False,
+        clear_daily: bool = False,
+    ) -> bool:
+        """
+        设置 key 的限额。
+        rpm_limit/daily_token_limit 为 None 时表示不改；
+        要清空请用 clear_rpm=True 或 clear_daily=True。
+        """
+        with self._lock:
+            info = self._keys.get(key)
+            if not info:
+                return False
+            if clear_rpm:
+                info.rpm_limit = None
+            elif rpm_limit is not None:
+                info.rpm_limit = rpm_limit
+            if clear_daily:
+                info.daily_token_limit = None
+            elif daily_token_limit is not None:
+                info.daily_token_limit = daily_token_limit
+            self._save()
+            logger.info(
+                "更新 key 限额: name=%s rpm=%s daily=%s",
+                info.name, info.rpm_limit, info.daily_token_limit,
+            )
             return True
 
     def delete_key(self, key: str) -> bool:

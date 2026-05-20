@@ -20,24 +20,32 @@ import asyncio
 import json
 import logging
 import os
+import pathlib
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import config
 from .api_keys import KeyInfo, manager as key_mgr
+from .errors import OpenAIError, openai_error_handler
 from .feishu_client import TokenExpiredError, client as feishu
 from .models import is_supported, list_models
+from .rate_limit import RateLimiter
+from .usage import manager as usage_mgr
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("relay")
+
+rate_limiter = RateLimiter(usage_mgr)
 
 
 # ============================================================================
@@ -120,6 +128,18 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+# OpenAI 标准错误格式
+app.add_exception_handler(HTTPException, openai_error_handler)
+
+# Dashboard 静态文件
+_DASHBOARD_DIR = pathlib.Path(__file__).parent / "dashboard"
+if _DASHBOARD_DIR.exists():
+    app.mount(
+        "/admin/dashboard/static",
+        StaticFiles(directory=_DASHBOARD_DIR / "static"),
+        name="dashboard-static",
+    )
+
 
 # ============================================================================
 # Pydantic models — OpenAI Chat Completions 格式
@@ -174,7 +194,7 @@ def _extract_key(request: Request) -> str:
     """从 Authorization header 提取 key 字符串。"""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+        raise OpenAIError("authentication_error", "Missing Authorization header", status=401)
     return auth[7:]
 
 
@@ -183,7 +203,8 @@ def _check_auth(request: Request) -> KeyInfo:
     key = _extract_key(request)
     info = key_mgr.validate(key)
     if not info:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+        raise OpenAIError("authentication_error", "Invalid API key",
+                          status=401, code="invalid_api_key")
     return info
 
 
@@ -191,7 +212,8 @@ def _check_admin(request: Request) -> KeyInfo:
     """验证 admin key。"""
     info = _check_auth(request)
     if not info.is_admin:
-        raise HTTPException(status_code=403, detail="Admin key required")
+        raise OpenAIError("permission_error", "Admin key required",
+                          status=403, code="admin_required")
     return info
 
 
@@ -200,26 +222,41 @@ def _check_admin(request: Request) -> KeyInfo:
 # ============================================================================
 
 
-@app.post("/v1/chat/completions", response_model=ChatResponse)
+@app.post("/v1/chat/completions")
 async def chat_completions(req: ChatRequest, request: Request):
     key_info = _check_auth(request)
     t0 = time.time()
 
-    if req.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="stream=true 暂不支持（飞书轮询模式无法流式）",
-        )
-
     # 校验模型在白名单
     if not is_supported(req.model):
-        raise HTTPException(
-            status_code=400,
-            detail=f"unsupported model: {req.model}. 支持的模型: {list_models()}",
+        raise OpenAIError(
+            "invalid_request_error",
+            f"Unsupported model: {req.model}. Supported: {list_models()}",
+            status=400, code="model_not_found", param="model",
         )
 
     if not req.messages:
-        raise HTTPException(status_code=400, detail="messages 不能为空")
+        raise OpenAIError("invalid_request_error", "messages cannot be empty",
+                          status=400, param="messages")
+
+    # 限流检查
+    if key_info.rpm_limit:
+        ok, retry = rate_limiter.check_rpm(key_info.name, key_info.rpm_limit)
+        if not ok:
+            raise OpenAIError(
+                "rate_limit_error",
+                f"Rate limit ({key_info.rpm_limit}/min) exceeded, retry in {retry}s",
+                status=429, code="rate_limit_exceeded", retry_after=retry,
+            )
+
+    if key_info.daily_token_limit:
+        used = usage_mgr.daily_token_count(key_info.name)
+        if used >= key_info.daily_token_limit:
+            raise OpenAIError(
+                "rate_limit_error",
+                f"Daily token quota exhausted ({used}/{key_info.daily_token_limit})",
+                status=429, code="daily_quota_exceeded",
+            )
 
     # 摘取最后一条 user 消息用于日志
     last_user = ""
@@ -241,8 +278,9 @@ async def chat_completions(req: ChatRequest, request: Request):
     if req.max_tokens is not None:
         payload["max_tokens"] = req.max_tokens
 
-    logger.info("→ [%s] [%s] req_id=%s msgs=%d last=%s",
-                key_info.name, req.model, req_id, len(req.messages), last_user[:60])
+    logger.info("→ [%s] [%s] req_id=%s msgs=%d stream=%s last=%s",
+                key_info.name, req.model, req_id, len(req.messages),
+                req.stream, last_user[:60])
 
     before_ms = int(time.time() * 1000)
 
@@ -250,42 +288,64 @@ async def chat_completions(req: ChatRequest, request: Request):
     try:
         await feishu.send_message(json.dumps(payload, ensure_ascii=False))
     except TokenExpiredError as e:
+        usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 401, time.time() - t0, last_user)
-        raise HTTPException(status_code=401, detail=str(e))
+        raise OpenAIError("authentication_error", str(e), status=401)
     except RuntimeError as e:
+        usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 502, time.time() - t0, last_user)
-        raise HTTPException(status_code=502, detail=str(e))
+        raise OpenAIError("api_error", str(e), status=502)
 
     # 按 req_id 轮询 bot 响应
     reply = await feishu.poll_reply_by_req_id(req_id, after_ms=before_ms)
     if reply is None:
+        usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 504, time.time() - t0, last_user)
-        raise HTTPException(
-            status_code=504,
-            detail=f"Bot 在 {config.POLL_TIMEOUT_S}s 内没有匹配 req_id={req_id} 的回复",
+        raise OpenAIError(
+            "api_error",
+            f"Bot did not respond within {config.POLL_TIMEOUT_S}s (req_id={req_id})",
+            status=504,
         )
 
     duration = time.time() - t0
 
     if not reply.get("ok"):
+        usage_mgr.record_failed(key_info.name, req.model)
         status = reply.get("status", 502)
         msg = reply.get("message", "upstream error")
+        err_type = "rate_limit_error" if status == 429 else "api_error"
         logger.warning("← [%s] [%s] req_id=%s FAIL status=%d msg=%s",
                        key_info.name, req.model, req_id, status, msg[:120])
         _log_access(key_info.name, req.model, status, duration, last_user)
-        raise HTTPException(status_code=status, detail=msg)
+        raise OpenAIError(err_type, msg, status=status)
 
     content = reply.get("content", "")
     usage_dict = reply.get("usage") or {}
     finish_reason = reply.get("finish_reason", "stop")
+    p_tok = usage_dict.get("prompt_tokens", 0)
+    c_tok = usage_dict.get("completion_tokens", 0)
+    t_tok = usage_dict.get("total_tokens", p_tok + c_tok)
+
+    # 记录用量（成功）
+    usage_mgr.record(key_info.name, req.model, p_tok, c_tok)
 
     logger.info("← [%s] [%s] req_id=%s %.1fs tokens=%d/%d %s",
-                key_info.name, req.model, req_id, duration,
-                usage_dict.get("prompt_tokens", 0),
-                usage_dict.get("completion_tokens", 0),
+                key_info.name, req.model, req_id, duration, p_tok, c_tok,
                 content[:60])
     _log_access(key_info.name, req.model, 200, duration, last_user)
 
+    # ----- 流式分支（伪流式） -----
+    if req.stream:
+        return StreamingResponse(
+            _sse_stream(req_id, req.model, content, finish_reason),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",      # nginx 关 buffering
+            },
+        )
+
+    # ----- 普通响应 -----
     return ChatResponse(
         id=f"chatcmpl-{req_id}",
         created=int(time.time()),
@@ -294,12 +354,50 @@ async def chat_completions(req: ChatRequest, request: Request):
             message=ChoiceMessage(content=content),
             finish_reason=finish_reason,
         )],
-        usage=Usage(
-            prompt_tokens=usage_dict.get("prompt_tokens", 0),
-            completion_tokens=usage_dict.get("completion_tokens", 0),
-            total_tokens=usage_dict.get("total_tokens", 0),
-        ),
+        usage=Usage(prompt_tokens=p_tok, completion_tokens=c_tok, total_tokens=t_tok),
     )
+
+
+# ----- SSE chunk emit -----
+
+def _sse_chunk(req_id: str, model: str, delta: dict, finish_reason: Optional[str]) -> str:
+    """构造一条 OpenAI 格式的 SSE chunk。"""
+    obj = {
+        "id": f"chatcmpl-{req_id}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }],
+    }
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _split_for_stream(text: str, chunk_chars: int = 12) -> list:
+    """把完整文本切成小块用于"伪流式"。"""
+    if not text:
+        return [""]
+    return [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
+
+
+async def _sse_stream(req_id: str, model: str, content: str, finish_reason: str):
+    """SSE 生成器：role chunk + N 个 content chunk + finish chunk + [DONE]。"""
+    # 1) role chunk
+    yield _sse_chunk(req_id, model, {"role": "assistant"}, None)
+    await asyncio.sleep(0.01)
+
+    # 2) content chunks
+    chunks = _split_for_stream(content, chunk_chars=12)
+    for piece in chunks:
+        yield _sse_chunk(req_id, model, {"content": piece}, None)
+        await asyncio.sleep(0.02)   # 每块 20ms，模拟流式
+
+    # 3) finish chunk
+    yield _sse_chunk(req_id, model, {}, finish_reason)
+    yield "data: [DONE]\n\n"
 
 
 # ============================================================================
@@ -389,10 +487,13 @@ async def admin_list_keys(request: Request):
         "total": len(keys),
         "keys": [
             {
+                "key": k.key,                       # admin 自己看可以拿完整 key
                 "key_prefix": k.key[:12] + "***",
                 "name": k.name,
                 "enabled": k.enabled,
                 "is_admin": k.is_admin,
+                "rpm_limit": k.rpm_limit,
+                "daily_token_limit": k.daily_token_limit,
                 "created_at": k.created_at,
             }
             for k in keys
@@ -405,4 +506,138 @@ async def admin_revoke_key(key: str, request: Request):
     _check_admin(request)
     if key_mgr.revoke_key(key):
         return {"status": "revoked", "key_prefix": key[:12] + "***"}
-    raise HTTPException(status_code=404, detail="Key not found")
+    raise OpenAIError("not_found_error", "Key not found", status=404)
+
+
+class PatchKeyRequest(BaseModel):
+    rpm_limit: Optional[int] = None
+    daily_token_limit: Optional[int] = None
+    clear_rpm: bool = False
+    clear_daily: bool = False
+    enabled: Optional[bool] = None
+
+
+@app.patch("/admin/keys/{key}")
+async def admin_patch_key(key: str, req: PatchKeyRequest, request: Request):
+    _check_admin(request)
+
+    if key not in key_mgr._keys:
+        raise OpenAIError("not_found_error", "Key not found", status=404)
+
+    if req.enabled is True:
+        key_mgr.enable_key(key)
+    elif req.enabled is False:
+        key_mgr.revoke_key(key)
+
+    if (
+        req.rpm_limit is not None
+        or req.daily_token_limit is not None
+        or req.clear_rpm
+        or req.clear_daily
+    ):
+        key_mgr.set_limits(
+            key,
+            rpm_limit=req.rpm_limit,
+            daily_token_limit=req.daily_token_limit,
+            clear_rpm=req.clear_rpm,
+            clear_daily=req.clear_daily,
+        )
+
+    info = key_mgr._keys[key]
+    return {
+        "key_prefix": info.key[:12] + "***",
+        "name": info.name,
+        "enabled": info.enabled,
+        "is_admin": info.is_admin,
+        "rpm_limit": info.rpm_limit,
+        "daily_token_limit": info.daily_token_limit,
+    }
+
+
+@app.get("/admin/keys/{key}/usage")
+async def admin_key_usage(key: str, request: Request):
+    _check_admin(request)
+    info = key_mgr._keys.get(key)
+    if not info:
+        raise OpenAIError("not_found_error", "Key not found", status=404)
+
+    stats = usage_mgr.get(info.name)
+    daily = usage_mgr.daily_token_count(info.name)
+    current_rpm = rate_limiter.rpm_current(info.name)
+
+    if stats is None:
+        return {
+            "key_prefix": info.key[:12] + "***",
+            "name": info.name,
+            "total_requests": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "total_tokens": 0,
+            "last_used_at": "",
+            "by_model": {},
+            "by_day": {},
+            "daily_token_count_today": 0,
+            "current_rpm": current_rpm,
+            "rpm_limit": info.rpm_limit,
+            "daily_token_limit": info.daily_token_limit,
+        }
+
+    return {
+        "key_prefix": info.key[:12] + "***",
+        "name": info.name,
+        "total_requests": stats.total_requests,
+        "total_prompt_tokens": stats.total_prompt_tokens,
+        "total_completion_tokens": stats.total_completion_tokens,
+        "total_tokens": stats.total_tokens,
+        "last_used_at": stats.last_used_at,
+        "by_model": stats.by_model,
+        "by_day": stats.by_day,
+        "daily_token_count_today": daily,
+        "current_rpm": current_rpm,
+        "rpm_limit": info.rpm_limit,
+        "daily_token_limit": info.daily_token_limit,
+    }
+
+
+@app.get("/admin/usage")
+async def admin_usage_summary(request: Request):
+    _check_admin(request)
+    today = usage_mgr.global_today()
+    all_stats = usage_mgr.all()
+
+    per_key = []
+    for key_info in key_mgr.list_keys():
+        s = all_stats.get(key_info.name)
+        per_key.append({
+            "key": key_info.key,                       # admin 看完整 key
+            "key_prefix": key_info.key[:12] + "***",
+            "name": key_info.name,
+            "enabled": key_info.enabled,
+            "is_admin": key_info.is_admin,
+            "rpm_limit": key_info.rpm_limit,
+            "daily_token_limit": key_info.daily_token_limit,
+            "total_requests": s.total_requests if s else 0,
+            "total_tokens": s.total_tokens if s else 0,
+            "today_tokens": usage_mgr.daily_token_count(key_info.name),
+            "current_rpm": rate_limiter.rpm_current(key_info.name),
+            "last_used_at": s.last_used_at if s else "",
+        })
+
+    return {
+        "today": today,
+        "keys": per_key,
+    }
+
+
+# ============================================================================
+# Dashboard
+# ============================================================================
+
+
+@app.get("/admin/dashboard", response_class=HTMLResponse, include_in_schema=False)
+async def admin_dashboard():
+    """Web 管理控制台。"""
+    html_file = _DASHBOARD_DIR / "index.html"
+    if not html_file.exists():
+        return HTMLResponse("<h1>Dashboard not deployed</h1>", status_code=503)
+    return HTMLResponse(html_file.read_text(encoding="utf-8"))

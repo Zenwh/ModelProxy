@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Relay Console</title>
+<link rel="stylesheet" href="/llm/api/admin/dashboard/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="bar">
+    <h1>🔑 LLM Relay Console</h1>
+    <div id="auth-state">
+      <span id="auth-info" class="muted">未登录</span>
+      <button id="logout-btn" class="ghost hidden" onclick="logout()">注销</button>
+    </div>
+  </div>
+</header>
+
+<!-- 登录区 -->
+<section id="login-section" class="card">
+  <h2>管理员登录</h2>
+  <p class="muted">输入 admin key（带 <code>is_admin=true</code> 的那种）。会存到浏览器本地以便后续刷新自动登录。</p>
+  <div class="login-row">
+    <input id="admin-key-input" type="password" placeholder="sk-relay-xxx" autocomplete="off">
+    <button class="primary" onclick="login()">进入</button>
+  </div>
+  <p id="login-err" class="error hidden"></p>
+</section>
+
+<!-- 主面板 -->
+<main id="main-panel" class="hidden">
+
+  <!-- 顶部 stat cards -->
+  <section class="stat-grid">
+    <div class="stat-card">
+      <div class="stat-label">活跃 Keys</div>
+      <div class="stat-value" id="stat-keys">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">今日调用</div>
+      <div class="stat-value" id="stat-requests">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">今日 Tokens</div>
+      <div class="stat-value" id="stat-tokens">-</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Token 状态</div>
+      <div class="stat-value small" id="stat-token-remaining">-</div>
+    </div>
+  </section>
+
+  <!-- Keys 列表 -->
+  <section class="card">
+    <div class="card-head">
+      <h2>API Keys</h2>
+      <button class="primary" onclick="openCreate()">+ 新建 Key</button>
+    </div>
+    <div id="keys-loading" class="muted">加载中...</div>
+    <table id="keys-table" class="data-table hidden">
+      <thead>
+        <tr>
+          <th>名称</th>
+          <th>Key</th>
+          <th>状态</th>
+          <th>类型</th>
+          <th>RPM</th>
+          <th>日 Token 配额</th>
+          <th>累计请求</th>
+          <th>今日 Token</th>
+          <th>最近活跃</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="keys-tbody"></tbody>
+    </table>
+  </section>
+
+  <!-- 单 key 详情 -->
+  <section id="detail-section" class="card hidden">
+    <div class="card-head">
+      <h2>📊 Key 详情：<span id="detail-name"></span></h2>
+      <button class="ghost" onclick="closeDetail()">关闭</button>
+    </div>
+    <div class="detail-grid">
+      <div>
+        <h3>按模型用量</h3>
+        <table class="data-table compact">
+          <thead><tr><th>模型</th><th>请求</th><th>输入 token</th><th>输出 token</th></tr></thead>
+          <tbody id="detail-by-model"></tbody>
+        </table>
+      </div>
+      <div>
+        <h3>近 14 天</h3>
+        <table class="data-table compact">
+          <thead><tr><th>日期</th><th>请求</th><th>输入</th><th>输出</th></tr></thead>
+          <tbody id="detail-by-day"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="detail-limits">
+      <h3>限额设置</h3>
+      <div class="form-row">
+        <label>RPM 限制（每分钟请求数）</label>
+        <input id="limit-rpm" type="number" min="0" placeholder="留空 = 无限制">
+      </div>
+      <div class="form-row">
+        <label>日 Token 上限</label>
+        <input id="limit-daily" type="number" min="0" placeholder="留空 = 无限制">
+      </div>
+      <button class="primary" onclick="saveLimits()">保存</button>
+      <span id="limit-status" class="muted"></span>
+    </div>
+  </section>
+
+</main>
+
+<!-- 创建 Key 弹窗 -->
+<div id="create-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>新建 API Key</h3>
+    <div class="form-row">
+      <label>名称（标识用途）</label>
+      <input id="new-key-name" type="text" placeholder="例如：zen-app">
+    </div>
+    <div class="form-row">
+      <label><input id="new-key-admin" type="checkbox"> 是 Admin key（可管理其它 key）</label>
+    </div>
+    <div class="form-row">
+      <label>RPM 限制（可选）</label>
+      <input id="new-key-rpm" type="number" min="0" placeholder="无限制">
+    </div>
+    <div class="form-row">
+      <label>日 Token 上限（可选）</label>
+      <input id="new-key-daily" type="number" min="0" placeholder="无限制">
+    </div>
+    <div class="modal-actions">
+      <button class="ghost" onclick="closeCreate()">取消</button>
+      <button class="primary" onclick="createKey()">创建</button>
+    </div>
+    <div id="new-key-result" class="hidden">
+      <p>✅ 创建成功，请保存这个 Key（之后不会完整显示）：</p>
+      <pre id="new-key-display"></pre>
+    </div>
+  </div>
+</div>
+
+<script src="/llm/api/admin/dashboard/static/app.js"></script>
+</body>
+</html>

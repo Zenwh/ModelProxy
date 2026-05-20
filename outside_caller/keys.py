@@ -83,6 +83,24 @@ def cmd_delete(args):
         sys.exit(1)
 
 
+def cmd_set_limit(args):
+    mgr = APIKeyManager()
+    ok = mgr.set_limits(
+        args.key,
+        rpm_limit=args.rpm,
+        daily_token_limit=args.daily_tokens,
+        clear_rpm=args.clear_rpm,
+        clear_daily=args.clear_daily,
+    )
+    if not ok:
+        print(f"❌ 未找到 key: {args.key}")
+        sys.exit(1)
+    info = mgr._keys[args.key]
+    print(f"✅ 已更新 key {_mask_key(args.key)} 的限额：")
+    print(f"   RPM:          {info.rpm_limit if info.rpm_limit else '无限制'}")
+    print(f"   Daily Tokens: {info.daily_token_limit if info.daily_token_limit else '无限制'}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="python -m outside_caller.keys",
@@ -114,6 +132,15 @@ def main():
     p_delete = sub.add_parser("delete", help="永久删除 API Key")
     p_delete.add_argument("key", help="要删除的 key")
     p_delete.set_defaults(func=cmd_delete)
+
+    # set-limit
+    p_limit = sub.add_parser("set-limit", help="设置 key 的限额")
+    p_limit.add_argument("key", help="要修改的 key")
+    p_limit.add_argument("--rpm", type=int, help="每分钟请求数上限")
+    p_limit.add_argument("--daily-tokens", type=int, help="每日 token 上限")
+    p_limit.add_argument("--clear-rpm", action="store_true", help="清除 RPM 限制")
+    p_limit.add_argument("--clear-daily", action="store_true", help="清除日 token 限制")
+    p_limit.set_defaults(func=cmd_set_limit)
 
     args = parser.parse_args()
     args.func(args)
