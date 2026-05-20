@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from . import config
 from .anthropic_sse import anthropic_sse_stream
 from .api_keys import KeyInfo, manager as key_mgr
-from .errors import AnthropicError, OpenAIError, error_handler
+from .errors import AnthropicError, OpenAIError, error_handler, validation_error_handler
 from .feishu_client import TokenExpiredError, client as feishu
 from .models import is_supported, list_models
 from .rate_limit import RateLimiter
@@ -132,6 +132,10 @@ app = FastAPI(
 # 错误格式（根据路径自动 OpenAI/Anthropic 切换）
 app.add_exception_handler(HTTPException, error_handler)
 
+# 422 校验错误也走对应格式
+from fastapi.exceptions import RequestValidationError
+app.add_exception_handler(RequestValidationError, validation_error_handler)
+
 # Dashboard 静态文件
 _DASHBOARD_DIR = pathlib.Path(__file__).parent / "dashboard"
 if _DASHBOARD_DIR.exists():
@@ -203,10 +207,12 @@ class AnthropicTool(BaseModel):
     input_schema: dict
 
 
+DEFAULT_MAX_TOKENS = 4096   # /v1/messages 客户端没传时的默认上限
+
 class MessagesRequest(BaseModel):
     model: str
     messages: List[AnthropicMessage]
-    max_tokens: int
+    max_tokens: Optional[int] = None   # 缺省时自动填 DEFAULT_MAX_TOKENS
     system: Optional[Any] = None      # str | List[dict]
     temperature: Optional[float] = None
     top_p: Optional[float] = None
@@ -489,6 +495,9 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
         "mode": "messages_native",
         **req.model_dump(exclude_none=True),
     }
+    # MP /v1/messages 要求 max_tokens 必填
+    if not payload.get("max_tokens"):
+        payload["max_tokens"] = DEFAULT_MAX_TOKENS
     # stream 由 relay 端伪流，bot 端不需要
     payload.pop("stream", None)
 

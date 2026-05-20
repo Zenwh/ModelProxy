@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 
@@ -136,6 +137,27 @@ async def error_handler(request: Request, exc: HTTPException) -> JSONResponse:
         body = _to_openai_body(error_type, exc.detail, error_code, error_param)
 
     return JSONResponse(status_code=exc.status_code, content=body, headers=headers)
+
+
+async def validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """422 校验错误：抓取首个错误信息，按路径包装成对应格式。"""
+    errs = exc.errors() if hasattr(exc, "errors") else []
+    if errs:
+        first = errs[0]
+        loc = ".".join(str(x) for x in first.get("loc", []) if x not in ("body",))
+        msg = first.get("msg", "validation error")
+        message = f"{loc}: {msg}" if loc else msg
+        param = loc or None
+    else:
+        message = str(exc)
+        param = None
+
+    headers = {}
+    if _is_anthropic_path(request):
+        body = _to_anthropic_body("invalid_request_error", message)
+    else:
+        body = _to_openai_body("invalid_request_error", message, None, param)
+    return JSONResponse(status_code=400, content=body, headers=headers)
 
 
 # 向后兼容旧名字
