@@ -24,7 +24,7 @@ import pathlib
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -32,8 +32,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import config
+from .anthropic_sse import anthropic_sse_stream
 from .api_keys import KeyInfo, manager as key_mgr
-from .errors import OpenAIError, openai_error_handler
+from .errors import AnthropicError, OpenAIError, error_handler
 from .feishu_client import TokenExpiredError, client as feishu
 from .models import is_supported, list_models
 from .rate_limit import RateLimiter
@@ -128,8 +129,8 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-# OpenAI 标准错误格式
-app.add_exception_handler(HTTPException, openai_error_handler)
+# 错误格式（根据路径自动 OpenAI/Anthropic 切换）
+app.add_exception_handler(HTTPException, error_handler)
 
 # Dashboard 静态文件
 _DASHBOARD_DIR = pathlib.Path(__file__).parent / "dashboard"
@@ -186,16 +187,52 @@ class ChatResponse(BaseModel):
 
 
 # ============================================================================
+# Pydantic models — Anthropic Messages API
+# ============================================================================
+
+
+class AnthropicMessage(BaseModel):
+    """Anthropic 的 message：role + content（content 可以是 string 或 block 数组）。"""
+    role: str
+    content: Any   # str | List[dict]
+
+
+class AnthropicTool(BaseModel):
+    name: str
+    description: Optional[str] = None
+    input_schema: dict
+
+
+class MessagesRequest(BaseModel):
+    model: str
+    messages: List[AnthropicMessage]
+    max_tokens: int
+    system: Optional[Any] = None      # str | List[dict]
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    stop_sequences: Optional[List[str]] = None
+    stream: bool = False
+    tools: Optional[List[AnthropicTool]] = None
+    tool_choice: Optional[dict] = None
+    metadata: Optional[dict] = None
+
+
+# ============================================================================
 # 鉴权
 # ============================================================================
 
 
 def _extract_key(request: Request) -> str:
-    """从 Authorization header 提取 key 字符串。"""
+    """从 Authorization 或 x-api-key (Anthropic SDK) header 提取 key。"""
+    # Anthropic SDK 默认用 x-api-key header
+    xkey = request.headers.get("x-api-key", "")
+    if xkey:
+        return xkey
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise OpenAIError("authentication_error", "Missing Authorization header", status=401)
-    return auth[7:]
+    if auth.startswith("Bearer "):
+        return auth[7:]
+    raise OpenAIError("authentication_error", "Missing Authorization header", status=401)
 
 
 def _check_auth(request: Request) -> KeyInfo:
@@ -401,6 +438,150 @@ async def _sse_stream(req_id: str, model: str, content: str, finish_reason: str)
 
 
 # ============================================================================
+# /v1/messages —— Anthropic 原生协议入口
+# ============================================================================
+
+
+@app.post("/v1/messages")
+async def messages_endpoint(req: MessagesRequest, request: Request):
+    """Anthropic Messages API 入口。仅 Claude 系模型。"""
+    key_info = _check_auth(request)
+    t0 = time.time()
+
+    # 1. 模型限制：仅 Claude
+    if not req.model.startswith("claude-"):
+        raise AnthropicError(
+            "invalid_request_error",
+            f"/v1/messages only accepts Claude models, got: {req.model}",
+            status=400,
+        )
+    if not is_supported(req.model):
+        raise AnthropicError(
+            "invalid_request_error",
+            f"Unsupported model: {req.model}. Supported Claude: "
+            + ", ".join(m for m in list_models() if m.startswith("claude-")),
+            status=400,
+        )
+
+    # 2. 限流
+    if key_info.rpm_limit:
+        ok, retry = rate_limiter.check_rpm(key_info.name, key_info.rpm_limit)
+        if not ok:
+            raise AnthropicError(
+                "rate_limit_error",
+                f"Rate limit ({key_info.rpm_limit}/min) exceeded, retry in {retry}s",
+                status=429, retry_after=retry,
+            )
+    if key_info.daily_token_limit:
+        used = usage_mgr.daily_token_count(key_info.name)
+        if used >= key_info.daily_token_limit:
+            raise AnthropicError(
+                "rate_limit_error",
+                f"Daily token quota exhausted ({used}/{key_info.daily_token_limit})",
+                status=429,
+            )
+
+    # 3. 构造 relay 协议（messages_native 模式）
+    req_id = uuid.uuid4().hex[:24]
+    payload = {
+        "_relay_v": 1,
+        "req_id": req_id,
+        "mode": "messages_native",
+        **req.model_dump(exclude_none=True),
+    }
+    # stream 由 relay 端伪流，bot 端不需要
+    payload.pop("stream", None)
+
+    # 截一段 user 文本用日志
+    last_user = ""
+    if req.messages:
+        last = req.messages[-1]
+        c = last.content
+        if isinstance(c, str):
+            last_user = c
+        elif isinstance(c, list):
+            for blk in c:
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    last_user = blk.get("text", "")
+                    break
+
+    logger.info("→ [%s] [%s] req_id=%s mode=anthropic msgs=%d stream=%s last=%s",
+                key_info.name, req.model, req_id, len(req.messages),
+                req.stream, last_user[:60])
+
+    before_ms = int(time.time() * 1000)
+
+    # 4. 发飞书 + 轮询
+    try:
+        await feishu.send_message(json.dumps(payload, ensure_ascii=False))
+    except TokenExpiredError as e:
+        usage_mgr.record_failed(key_info.name, req.model)
+        _log_access(key_info.name, req.model, 401, time.time() - t0, last_user)
+        raise AnthropicError("authentication_error", str(e), status=401)
+    except RuntimeError as e:
+        usage_mgr.record_failed(key_info.name, req.model)
+        _log_access(key_info.name, req.model, 502, time.time() - t0, last_user)
+        raise AnthropicError("api_error", str(e), status=502)
+
+    reply = await feishu.poll_reply_by_req_id(req_id, after_ms=before_ms)
+    if reply is None:
+        usage_mgr.record_failed(key_info.name, req.model)
+        _log_access(key_info.name, req.model, 504, time.time() - t0, last_user)
+        raise AnthropicError(
+            "api_error",
+            f"Bot did not respond within {config.POLL_TIMEOUT_S}s (req_id={req_id})",
+            status=504,
+        )
+
+    duration = time.time() - t0
+
+    if not reply.get("ok"):
+        usage_mgr.record_failed(key_info.name, req.model)
+        status = reply.get("status", 502)
+        msg = reply.get("message", "upstream error")
+        err_type = "rate_limit_error" if status == 429 else "api_error"
+        if status == 401:
+            err_type = "authentication_error"
+        elif status == 400:
+            err_type = "invalid_request_error"
+        logger.warning("← [%s] [%s] req_id=%s FAIL status=%d msg=%s",
+                       key_info.name, req.model, req_id, status, msg[:120])
+        _log_access(key_info.name, req.model, status, duration, last_user)
+        raise AnthropicError(err_type, msg, status=status)
+
+    raw = reply.get("raw_anthropic") or {}
+    if not raw or "content" not in raw:
+        usage_mgr.record_failed(key_info.name, req.model)
+        raise AnthropicError("api_error", "Empty/invalid response from bot",
+                             status=502)
+
+    # 5. 记录用量
+    rusage = raw.get("usage") or {}
+    in_tok = rusage.get("input_tokens", 0)
+    out_tok = rusage.get("output_tokens", 0)
+    usage_mgr.record(key_info.name, req.model, in_tok, out_tok)
+
+    logger.info("← [%s] [%s] req_id=%s %.1fs in/out=%d/%d stop=%s",
+                key_info.name, req.model, req_id, duration,
+                in_tok, out_tok, raw.get("stop_reason"))
+    _log_access(key_info.name, req.model, 200, duration, last_user)
+
+    # 6. 响应：流式 or 非流式
+    if req.stream:
+        return StreamingResponse(
+            anthropic_sse_stream(raw),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # 非流式直接返回 raw（即 MP 的原 Anthropic 响应）
+    return raw
+
+
+# ============================================================================
 # 辅助接口
 # ============================================================================
 
@@ -416,6 +597,11 @@ async def list_models_endpoint(request: Request):
                 "object": "model",
                 "created": 0,
                 "owned_by": "stepfun-relay",
+                "endpoints": (
+                    ["/v1/chat/completions", "/v1/messages"]
+                    if name.startswith("claude-")
+                    else ["/v1/chat/completions"]
+                ),
             }
             for name in list_models()
         ],

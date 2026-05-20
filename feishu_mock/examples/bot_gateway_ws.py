@@ -301,8 +301,14 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
     req_id = req["req_id"]
     model_pub = req.get("model", "")
+    mode = req.get("mode", "openai_chat")
     messages = req.get("messages", [])
-    logger.info("← req_id=%s model=%s msgs=%d", req_id, model_pub, len(messages))
+    logger.info("← req_id=%s mode=%s model=%s msgs=%d", req_id, mode, model_pub, len(messages))
+
+    # ---- 分支：Anthropic 原生 /v1/messages ----
+    if mode == "messages_native":
+        _spawn_handle_anthropic(req, chat_id)
+        return
 
     def _handle():
         try:
@@ -360,6 +366,70 @@ def on_message(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
             })
 
     # 子线程处理，避免阻塞 websocket（飞书 3s ACK 限制）
+    threading.Thread(target=_handle, daemon=True).start()
+
+
+# ---- Anthropic /v1/messages 通道 -------------------------------------------
+
+def _spawn_handle_anthropic(req: dict, chat_id: str) -> None:
+    """处理 mode=messages_native 请求：直通 MP /v1/messages，原响应打包回 relay。"""
+    req_id = req["req_id"]
+    model_pub = req.get("model", "")
+
+    def _handle():
+        try:
+            mp_model = to_mp_name(model_pub)
+            if not mp_model:
+                send_relay_response(chat_id, {
+                    "_relay_v": 1, "req_id": req_id,
+                    "ok": False, "status": 400,
+                    "error": "unsupported_model",
+                    "message": f"unsupported model: {model_pub}",
+                })
+                return
+
+            # 构造 MP /v1/messages payload
+            # 把 relay 协议 fields 拿掉，剩下的就是 Anthropic 字段
+            payload = {
+                k: v for k, v in req.items()
+                if k not in ("_relay_v", "req_id", "mode", "model", "stream")
+            }
+            payload["model"] = mp_model
+            # 显式不要 stream
+            payload.pop("stream", None)
+
+            status, mp_resp = _mp_post("/v1/messages", payload)
+
+            if status == 200 and "content" in mp_resp:
+                send_relay_response(chat_id, {
+                    "_relay_v": 1, "req_id": req_id,
+                    "ok": True,
+                    "mode": "messages_native",
+                    "raw_anthropic": mp_resp,
+                })
+            else:
+                # 上游错误：尽量保留原 message
+                err_msg = (
+                    mp_resp.get("error", {}).get("message") if isinstance(mp_resp.get("error"), dict)
+                    else mp_resp.get("msg")
+                    or str(mp_resp)[:300]
+                )
+                send_relay_response(chat_id, {
+                    "_relay_v": 1, "req_id": req_id,
+                    "ok": False,
+                    "status": status if status >= 400 else 502,
+                    "error": "upstream_error",
+                    "message": err_msg,
+                })
+        except Exception as e:
+            logger.exception("处理 messages_native req_id=%s 异常", req_id)
+            send_relay_response(chat_id, {
+                "_relay_v": 1, "req_id": req_id,
+                "ok": False, "status": 500,
+                "error": "bot_exception",
+                "message": f"{type(e).__name__}: {e}",
+            })
+
     threading.Thread(target=_handle, daemon=True).start()
 
 
