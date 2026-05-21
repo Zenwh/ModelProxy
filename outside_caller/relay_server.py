@@ -34,10 +34,10 @@ from pydantic import BaseModel, Field
 from . import config
 from .anthropic_sse import anthropic_sse_stream
 from .api_keys import KeyInfo, manager as key_mgr
+from .bot_pool import pool as bot_pool
 from .errors import AnthropicError, OpenAIError, error_handler, validation_error_handler
-from .feishu_client import TokenExpiredError, client as feishu
-from .models import is_supported, list_models
-from .nodes import manager as node_mgr
+from .feishu_token import TokenExpiredError, token_mgr
+from .models import is_supported, list_models, to_mp_name, to_endpoint
 from .rate_limit import RateLimiter
 from .usage import manager as usage_mgr
 
@@ -98,7 +98,7 @@ async def _token_refresh_loop():
     while True:
         await asyncio.sleep(REFRESH_CHECK_INTERVAL)
         try:
-            feishu.maybe_refresh()
+            token_mgr.maybe_refresh()
         except Exception as e:
             logger.warning("后台 token 刷新失败: %s", e)
 
@@ -108,7 +108,7 @@ async def _node_gc_loop():
     while True:
         await asyncio.sleep(NODE_GC_INTERVAL)
         try:
-            node_mgr.gc_stale(stale_after_s=NODE_STALE_AFTER_S)
+            bot_pool.gc_stale(stale_after_s=NODE_STALE_AFTER_S)
         except Exception as e:
             logger.warning("节点 GC 失败: %s", e)
 
@@ -118,14 +118,14 @@ async def _lifespan(app: FastAPI):
     _init_access_log()
     logger.info(
         "token 状态: remaining=%.0fs refresh_token=%s",
-        feishu.token_remaining_s,
-        "有" if feishu.has_refresh_token else "无",
+        token_mgr.token_remaining_s,
+        "有" if token_mgr.has_refresh_token else "无",
     )
     logger.info(
         "API Keys: %d 个（%d 活跃）",
         key_mgr.key_count, key_mgr.active_count,
     )
-    logger.info("Nodes: %d 个已知节点", node_mgr.count)
+    logger.info("Bot Pool: %d 个节点（%d 在线）", bot_pool.count, bot_pool.online_count)
 
     task_refresh = asyncio.create_task(_token_refresh_loop())
     task_gc = asyncio.create_task(_node_gc_loop())
@@ -331,10 +331,14 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     # 构造 relay 协议 payload
     req_id = uuid.uuid4().hex[:24]
+    mp_model = to_mp_name(req.model) or req.model
+    endpoint = to_endpoint(req.model) or "chat"
     payload = {
-        "_relay_v": 1,
+        "_relay_v": 2,
+        "type": "req",
         "req_id": req_id,
-        "model": req.model,
+        "model": mp_model,
+        "endpoint": endpoint,
         "messages": [m.model_dump() for m in req.messages],
     }
     if req.temperature is not None:
@@ -348,9 +352,16 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     before_ms = int(time.time() * 1000)
 
+    # 选一个在线 bot
+    node = bot_pool.select()
+    if not node:
+        usage_mgr.record_failed(key_info.name, req.model)
+        _log_access(key_info.name, req.model, 503, time.time() - t0, last_user)
+        raise OpenAIError("api_error", "No available bot nodes", status=503)
+
     # 发 JSON 消息到 bot
     try:
-        await feishu.send_message(json.dumps(payload, ensure_ascii=False))
+        await bot_pool.send_to_bot(node, json.dumps(payload, ensure_ascii=False))
     except TokenExpiredError as e:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 401, time.time() - t0, last_user)
@@ -361,7 +372,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise OpenAIError("api_error", str(e), status=502)
 
     # 按 req_id 轮询 bot 响应
-    reply = await feishu.poll_reply_by_req_id(req_id, after_ms=before_ms)
+    reply = await bot_pool.poll_reply_by_req_id(node, req_id, after_ms=before_ms)
     if reply is None:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 504, time.time() - t0, last_user)
@@ -541,9 +552,16 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
 
     before_ms = int(time.time() * 1000)
 
+    # 选一个在线 bot
+    node = bot_pool.select()
+    if not node:
+        usage_mgr.record_failed(key_info.name, req.model)
+        _log_access(key_info.name, req.model, 503, time.time() - t0, last_user)
+        raise AnthropicError("api_error", "No available bot nodes", status=503)
+
     # 4. 发飞书 + 轮询
     try:
-        await feishu.send_message(json.dumps(payload, ensure_ascii=False))
+        await bot_pool.send_to_bot(node, json.dumps(payload, ensure_ascii=False))
     except TokenExpiredError as e:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 401, time.time() - t0, last_user)
@@ -553,7 +571,7 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
         _log_access(key_info.name, req.model, 502, time.time() - t0, last_user)
         raise AnthropicError("api_error", str(e), status=502)
 
-    reply = await feishu.poll_reply_by_req_id(req_id, after_ms=before_ms)
+    reply = await bot_pool.poll_reply_by_req_id(node, req_id, after_ms=before_ms)
     if reply is None:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 504, time.time() - t0, last_user)
@@ -643,17 +661,19 @@ async def health():
     token_ok = False
     remaining = 0
     try:
-        feishu.get_token()
+        token_mgr.get_token()
         token_ok = True
-        remaining = feishu.token_remaining_s
+        remaining = token_mgr.token_remaining_s
     except TokenExpiredError:
         pass
     return {
         "status": "ok" if token_ok else "token_expired",
         "token_remaining_s": int(remaining),
-        "refresh_token_available": feishu.has_refresh_token,
+        "refresh_token_available": token_mgr.has_refresh_token,
         "api_keys_total": key_mgr.key_count,
         "api_keys_active": key_mgr.active_count,
+        "bot_nodes_total": bot_pool.count,
+        "bot_nodes_online": bot_pool.online_count,
         "relay_port": config.RELAY_PORT,
     }
 
@@ -846,7 +866,7 @@ async def admin_usage_summary(request: Request):
 
 
 # ============================================================================
-# Agent 接口（节点 bot 上报）
+# Agent 接口（节点 bot 上报）+ Admin 管控
 # ============================================================================
 
 
@@ -856,10 +876,13 @@ class HeartbeatRequest(BaseModel):
     version: Optional[str] = ""
     hostname: Optional[str] = ""
     ip: Optional[str] = ""
+    open_id: Optional[str] = ""
+    chat_id: Optional[str] = ""
     started_at: Optional[str] = ""
     status: Optional[str] = "online"
-    bots: Optional[List[Dict[str, Any]]] = None
+    load: Optional[float] = 0.0
     models: Optional[List[str]] = None
+    bots: Optional[List[Dict[str, Any]]] = None
     upstream: Optional[Dict[str, Any]] = None
     stats: Optional[Dict[str, Any]] = None
 
@@ -870,8 +893,8 @@ class AgentIdRequest(BaseModel):
 
 @app.post("/agent/heartbeat")
 async def agent_heartbeat(req: HeartbeatRequest, request: Request):
-    """节点 bot 上报心跳（公开接口，不需要 API key）。"""
-    rec = node_mgr.upsert(req.model_dump(exclude_none=False))
+    """节点 bot 上报心跳（公开接口，不需要 API key）。兼容 HTTP 方式。"""
+    rec = bot_pool.upsert_heartbeat(req.model_dump(exclude_none=False))
     return {
         "status": "ok",
         "node_id": rec.node_id,
@@ -884,7 +907,7 @@ async def agent_heartbeat(req: HeartbeatRequest, request: Request):
 @app.post("/agent/offline")
 async def agent_offline(req: AgentIdRequest):
     """节点 bot 优雅下线通知。"""
-    ok = node_mgr.mark_offline(req.node_id, reason="client")
+    ok = bot_pool.mark_offline(req.node_id, reason="client")
     return {"status": "ok" if ok else "not_found", "node_id": req.node_id}
 
 
@@ -892,7 +915,7 @@ async def agent_offline(req: AgentIdRequest):
 async def admin_list_nodes(request: Request):
     """Admin 查节点列表。"""
     _check_admin(request)
-    nodes = node_mgr.list_all()
+    nodes = bot_pool.list_all()
     online_count = sum(1 for n in nodes if n.status == "online")
     return {
         "total": len(nodes),
@@ -903,19 +926,85 @@ async def admin_list_nodes(request: Request):
                 "version": n.version,
                 "hostname": n.hostname,
                 "ip": n.ip,
+                "open_id": n.open_id,
+                "chat_id": n.chat_id,
                 "started_at": n.started_at,
                 "first_seen_at": n.first_seen_at,
                 "last_heartbeat_at": n.last_heartbeat_at,
                 "status": n.status,
-                "bots": n.bots,
+                "load": n.load,
                 "models": n.models,
-                "upstream": n.upstream,
-                "stats": n.stats,
+                "active_requests": n.active_requests,
                 "heartbeats_count": n.heartbeats_count,
             }
             for n in nodes
         ],
     }
+
+
+@app.get("/api/discovery")
+async def api_discovery():
+    """服务发现：返回在线 bot 列表（公开接口）。"""
+    nodes = bot_pool.list_online()
+    return {
+        "online": len(nodes),
+        "nodes": [
+            {
+                "node_id": n.node_id,
+                "status": n.status,
+                "version": n.version,
+                "models": n.models,
+                "load": n.load,
+                "last_heartbeat_at": n.last_heartbeat_at,
+            }
+            for n in nodes
+        ],
+    }
+
+
+class CtrlRequest(BaseModel):
+    target_version: Optional[str] = None
+
+
+@app.post("/admin/nodes/{node_id}/upgrade")
+async def admin_upgrade_node(node_id: str, req: CtrlRequest, request: Request):
+    """给指定 bot 发升级指令。"""
+    _check_admin(request)
+    node = bot_pool.get(node_id)
+    if not node:
+        raise OpenAIError("not_found_error", f"Node {node_id} not found", status=404)
+    await bot_pool.send_ctrl(node, "upgrade", target_version=req.target_version or "latest")
+    return {"status": "sent", "node_id": node_id, "action": "upgrade"}
+
+
+@app.post("/admin/nodes/{node_id}/restart")
+async def admin_restart_node(node_id: str, request: Request):
+    """给指定 bot 发重启指令。"""
+    _check_admin(request)
+    node = bot_pool.get(node_id)
+    if not node:
+        raise OpenAIError("not_found_error", f"Node {node_id} not found", status=404)
+    await bot_pool.send_ctrl(node, "restart")
+    return {"status": "sent", "node_id": node_id, "action": "restart"}
+
+
+@app.post("/admin/nodes/{node_id}/drain")
+async def admin_drain_node(node_id: str, request: Request):
+    """给指定 bot 发优雅下线指令。"""
+    _check_admin(request)
+    node = bot_pool.get(node_id)
+    if not node:
+        raise OpenAIError("not_found_error", f"Node {node_id} not found", status=404)
+    await bot_pool.send_ctrl(node, "drain")
+    return {"status": "sent", "node_id": node_id, "action": "drain"}
+
+
+@app.post("/admin/nodes/upgrade-all")
+async def admin_upgrade_all(req: CtrlRequest, request: Request):
+    """广播升级指令给所有在线 bot。"""
+    _check_admin(request)
+    sent = await bot_pool.broadcast_ctrl("upgrade", target_version=req.target_version or "latest")
+    return {"status": "sent", "count": len(sent), "node_ids": sent}
 
 
 # ============================================================================

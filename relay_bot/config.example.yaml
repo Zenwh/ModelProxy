@@ -1,0 +1,11 @@
+# 示例配置
+feishu:
+  app_id: cli_xxx
+  app_secret: your_app_secret_here
+
+mp:
+  url: http://mp.internal:8000
+
+# 可选
+node_id: ""                  # 空则自动用 hostname
+heartbeat_interval_s: 30

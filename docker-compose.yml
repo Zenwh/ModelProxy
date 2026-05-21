@@ -13,6 +13,13 @@
 #
 # 局域网访问：把 localhost 换成本机 IP（如 http://10.141.32.112:8088）
 #
+# 内网 PyPI 源（分发 relay-bot wheel）：
+#   启动后，目标机器安装 bot：
+#   pip install --index-url http://本机IP:9080/simple/ --trusted-host 本机IP feishu-relay-bot
+#
+#   升级 bot（新 wheel 放入 relay_bot/dist/ 后）：
+#   pip install -U --index-url http://本机IP:9080/simple/ --trusted-host 本机IP feishu-relay-bot
+#
 
 services:
   modelproxy-demo:
@@ -43,3 +50,16 @@ services:
     labels:
       com.modelproxy.role: "demo"
       com.modelproxy.version: "1.0.0"
+
+  # 内网 PyPI 源 — 分发 feishu-relay-bot wheel 给各 bot 机器
+  pypi:
+    image: pypiserver/pypiserver:latest
+    container_name: relay-bot-pypi
+    restart: unless-stopped
+    command: run -p 8080 /data/packages
+    ports:
+      - "${PYPI_PORT:-9080}:8080"
+    volumes:
+      - ./relay_bot/dist:/data/packages:ro
+    labels:
+      com.modelproxy.role: "pypi"
