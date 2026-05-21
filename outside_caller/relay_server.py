@@ -89,8 +89,6 @@ def _log_access(
 # ============================================================================
 
 REFRESH_CHECK_INTERVAL = 1800  # 每 30 分钟检查一次 user_access_token
-NODE_GC_INTERVAL = 60          # 每 60s 检查节点心跳
-NODE_STALE_AFTER_S = 90        # 90s 没心跳标 stale
 
 
 async def _token_refresh_loop():
@@ -101,16 +99,6 @@ async def _token_refresh_loop():
             token_mgr.maybe_refresh()
         except Exception as e:
             logger.warning("后台 token 刷新失败: %s", e)
-
-
-async def _node_gc_loop():
-    """后台标记长时间没心跳的节点为 stale。"""
-    while True:
-        await asyncio.sleep(NODE_GC_INTERVAL)
-        try:
-            bot_pool.gc_stale(stale_after_s=NODE_STALE_AFTER_S)
-        except Exception as e:
-            logger.warning("节点 GC 失败: %s", e)
 
 
 @asynccontextmanager
@@ -125,22 +113,16 @@ async def _lifespan(app: FastAPI):
         "API Keys: %d 个（%d 活跃）",
         key_mgr.key_count, key_mgr.active_count,
     )
-    logger.info("Bot Pool: %d 个节点（%d 在线）", bot_pool.count, bot_pool.online_count)
+    logger.info("Bot Pool: %d 个节点", bot_pool.count)
 
     task_refresh = asyncio.create_task(_token_refresh_loop())
-    task_gc = asyncio.create_task(_node_gc_loop())
-    logger.info(
-        "后台任务已启动：token-refresh(%ds), node-gc(%ds)",
-        REFRESH_CHECK_INTERVAL, NODE_GC_INTERVAL,
-    )
+    logger.info("后台任务已启动：token-refresh(%ds)", REFRESH_CHECK_INTERVAL)
     yield
     task_refresh.cancel()
-    task_gc.cancel()
-    for t in (task_refresh, task_gc):
-        try:
-            await t
-        except asyncio.CancelledError:
-            pass
+    try:
+        await task_refresh
+    except asyncio.CancelledError:
+        pass
 
 
 app = FastAPI(
@@ -333,18 +315,6 @@ async def chat_completions(req: ChatRequest, request: Request):
     req_id = uuid.uuid4().hex[:24]
     mp_model = to_mp_name(req.model) or req.model
     endpoint = to_endpoint(req.model) or "chat"
-    payload = {
-        "_relay_v": 2,
-        "type": "req",
-        "req_id": req_id,
-        "model": mp_model,
-        "endpoint": endpoint,
-        "messages": [m.model_dump() for m in req.messages],
-    }
-    if req.temperature is not None:
-        payload["temperature"] = req.temperature
-    if req.max_tokens is not None:
-        payload["max_tokens"] = req.max_tokens
 
     logger.info("→ [%s] [%s] req_id=%s msgs=%d stream=%s last=%s",
                 key_info.name, req.model, req_id, len(req.messages),
@@ -352,12 +322,35 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     before_ms = int(time.time() * 1000)
 
-    # 选一个在线 bot
+    # 选一个 bot
     node = bot_pool.select()
     if not node:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 503, time.time() - t0, last_user)
         raise OpenAIError("api_error", "No available bot nodes", status=503)
+    bot_pool.record_request(node)
+
+    # 根据节点版本构造 payload（v1 兼容旧 bot，v2 给新 bot）
+    if node.version:
+        payload = {
+            "_relay_v": 2,
+            "type": "req",
+            "req_id": req_id,
+            "model": mp_model,
+            "endpoint": endpoint,
+            "messages": [m.model_dump() for m in req.messages],
+        }
+    else:
+        payload = {
+            "_relay_v": 1,
+            "req_id": req_id,
+            "model": mp_model,
+            "messages": [m.model_dump() for m in req.messages],
+        }
+    if req.temperature is not None:
+        payload["temperature"] = req.temperature
+    if req.max_tokens is not None:
+        payload["max_tokens"] = req.max_tokens
 
     # 发 JSON 消息到 bot
     try:
@@ -397,12 +390,32 @@ async def chat_completions(req: ChatRequest, request: Request):
     content = reply.get("content", "")
     usage_dict = reply.get("usage") or {}
     finish_reason = reply.get("finish_reason", "stop")
+
+    # messages_native 模式：从 raw_anthropic 提取内容
+    if reply.get("mode") == "messages_native" and reply.get("raw_anthropic"):
+        raw = reply["raw_anthropic"]
+        parts = []
+        for blk in raw.get("content", []):
+            if blk.get("type") == "text":
+                parts.append(blk.get("text", ""))
+        content = "".join(parts)
+        au = raw.get("usage") or {}
+        usage_dict = {
+            "prompt_tokens": au.get("input_tokens", 0),
+            "completion_tokens": au.get("output_tokens", 0),
+            "total_tokens": au.get("input_tokens", 0) + au.get("output_tokens", 0),
+        }
+        finish_reason = raw.get("stop_reason", "stop")
+        if finish_reason == "end_turn":
+            finish_reason = "stop"
+
     p_tok = usage_dict.get("prompt_tokens", 0)
     c_tok = usage_dict.get("completion_tokens", 0)
     t_tok = usage_dict.get("total_tokens", p_tok + c_tok)
 
     # 记录用量（成功）
     usage_mgr.record(key_info.name, req.model, p_tok, c_tok)
+    bot_pool.record_usage(node, p_tok, c_tok)
 
     logger.info("← [%s] [%s] req_id=%s %.1fs tokens=%d/%d %s",
                 key_info.name, req.model, req_id, duration, p_tok, c_tok,
@@ -519,19 +532,21 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
                 status=429,
             )
 
-    # 3. 构造 relay 协议（messages_native 模式）
+    # 3. 构造 relay 协议
     req_id = uuid.uuid4().hex[:24]
+    req_data = req.model_dump(exclude_none=True)
+    req_data.pop("stream", None)
+    if not req_data.get("max_tokens"):
+        req_data["max_tokens"] = DEFAULT_MAX_TOKENS
+
     payload = {
-        "_relay_v": 1,
+        "_relay_v": 2,
+        "type": "req",
         "req_id": req_id,
+        "endpoint": "messages",
         "mode": "messages_native",
-        **req.model_dump(exclude_none=True),
+        **req_data,
     }
-    # MP /v1/messages 要求 max_tokens 必填
-    if not payload.get("max_tokens"):
-        payload["max_tokens"] = DEFAULT_MAX_TOKENS
-    # stream 由 relay 端伪流，bot 端不需要
-    payload.pop("stream", None)
 
     # 截一段 user 文本用日志
     last_user = ""
@@ -552,12 +567,13 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
 
     before_ms = int(time.time() * 1000)
 
-    # 选一个在线 bot
+    # 选一个 bot
     node = bot_pool.select()
     if not node:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 503, time.time() - t0, last_user)
         raise AnthropicError("api_error", "No available bot nodes", status=503)
+    bot_pool.record_request(node)
 
     # 4. 发飞书 + 轮询
     try:
@@ -608,6 +624,7 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
     in_tok = rusage.get("input_tokens", 0)
     out_tok = rusage.get("output_tokens", 0)
     usage_mgr.record(key_info.name, req.model, in_tok, out_tok)
+    bot_pool.record_usage(node, in_tok, out_tok)
 
     logger.info("← [%s] [%s] req_id=%s %.1fs in/out=%d/%d stop=%s",
                 key_info.name, req.model, req_id, duration,
@@ -672,8 +689,7 @@ async def health():
         "refresh_token_available": token_mgr.has_refresh_token,
         "api_keys_total": key_mgr.key_count,
         "api_keys_active": key_mgr.active_count,
-        "bot_nodes_total": bot_pool.count,
-        "bot_nodes_online": bot_pool.online_count,
+        "bot_nodes": bot_pool.count,
         "relay_port": config.RELAY_PORT,
     }
 
@@ -866,49 +882,8 @@ async def admin_usage_summary(request: Request):
 
 
 # ============================================================================
-# Agent 接口（节点 bot 上报）+ Admin 管控
+# Admin 管控接口
 # ============================================================================
-
-
-class HeartbeatRequest(BaseModel):
-    """节点 bot 的心跳上报。"""
-    node_id: str
-    version: Optional[str] = ""
-    hostname: Optional[str] = ""
-    ip: Optional[str] = ""
-    open_id: Optional[str] = ""
-    chat_id: Optional[str] = ""
-    started_at: Optional[str] = ""
-    status: Optional[str] = "online"
-    load: Optional[float] = 0.0
-    models: Optional[List[str]] = None
-    bots: Optional[List[Dict[str, Any]]] = None
-    upstream: Optional[Dict[str, Any]] = None
-    stats: Optional[Dict[str, Any]] = None
-
-
-class AgentIdRequest(BaseModel):
-    node_id: str
-
-
-@app.post("/agent/heartbeat")
-async def agent_heartbeat(req: HeartbeatRequest, request: Request):
-    """节点 bot 上报心跳（公开接口，不需要 API key）。兼容 HTTP 方式。"""
-    rec = bot_pool.upsert_heartbeat(req.model_dump(exclude_none=False))
-    return {
-        "status": "ok",
-        "node_id": rec.node_id,
-        "first_seen_at": rec.first_seen_at,
-        "heartbeats_count": rec.heartbeats_count,
-        "center_message": None,
-    }
-
-
-@app.post("/agent/offline")
-async def agent_offline(req: AgentIdRequest):
-    """节点 bot 优雅下线通知。"""
-    ok = bot_pool.mark_offline(req.node_id, reason="client")
-    return {"status": "ok" if ok else "not_found", "node_id": req.node_id}
 
 
 @app.get("/admin/nodes")
@@ -916,10 +891,8 @@ async def admin_list_nodes(request: Request):
     """Admin 查节点列表。"""
     _check_admin(request)
     nodes = bot_pool.list_all()
-    online_count = sum(1 for n in nodes if n.status == "online")
     return {
         "total": len(nodes),
-        "online": online_count,
         "nodes": [
             {
                 "node_id": n.node_id,
@@ -930,12 +903,13 @@ async def admin_list_nodes(request: Request):
                 "chat_id": n.chat_id,
                 "started_at": n.started_at,
                 "first_seen_at": n.first_seen_at,
-                "last_heartbeat_at": n.last_heartbeat_at,
-                "status": n.status,
+                "last_request_at": n.last_request_at,
                 "load": n.load,
                 "models": n.models,
-                "active_requests": n.active_requests,
-                "heartbeats_count": n.heartbeats_count,
+                "request_count": n.request_count,
+                "total_prompt_tokens": n.total_prompt_tokens,
+                "total_completion_tokens": n.total_completion_tokens,
+                "total_tokens": n.total_tokens,
             }
             for n in nodes
         ],
@@ -944,18 +918,18 @@ async def admin_list_nodes(request: Request):
 
 @app.get("/api/discovery")
 async def api_discovery():
-    """服务发现：返回在线 bot 列表（公开接口）。"""
-    nodes = bot_pool.list_online()
+    """服务发现：返回 bot 列表（公开接口）。"""
+    nodes = bot_pool.list_all()
     return {
-        "online": len(nodes),
+        "total": len(nodes),
         "nodes": [
             {
                 "node_id": n.node_id,
-                "status": n.status,
                 "version": n.version,
                 "models": n.models,
                 "load": n.load,
-                "last_heartbeat_at": n.last_heartbeat_at,
+                "last_request_at": n.last_request_at,
+                "request_count": n.request_count,
             }
             for n in nodes
         ],

@@ -97,7 +97,7 @@ async function refresh() {
 
 function renderStats(usage, health, nodes) {
   $('stat-nodes').textContent = nodes
-    ? `${nodes.online} / ${nodes.total}`
+    ? `${nodes.total} / ${nodes.total}`
     : '-';
   const activeCount = usage.keys.filter(k => k.enabled).length;
   $('stat-keys').textContent = `${activeCount} / ${usage.keys.length}`;
@@ -153,7 +153,7 @@ function renderNodesTable(nodes) {
   const tbody = $('nodes-tbody');
   tbody.innerHTML = '';
   const list = nodes?.nodes || [];
-  $('nodes-meta').textContent = nodes ? `共 ${nodes.total} 个节点，在线 ${nodes.online}` : '';
+  $('nodes-meta').textContent = nodes ? `共 ${nodes.total} 个节点` : '';
 
   if (!list.length) {
     tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">还没有节点上报。先在某台机器装 feishu-relay-bot，并配 center.url</td></tr>';
@@ -163,21 +163,15 @@ function renderNodesTable(nodes) {
   }
 
   list.forEach(n => {
-    const badge = n.status === 'online'
+    const badge = n.last_request_at
       ? '<span class="badge ok">online</span>'
-      : (n.status === 'stale'
-        ? '<span class="badge no">stale</span>'
-        : '<span class="badge no">offline</span>');
-    const bots = (n.bots || []).map(b => escapeHtml(b.name || '?')).join(', ') || '<span class="muted">-</span>';
+      : '<span class="badge no">idle</span>';
     const models = (n.models || []).slice(0, 4).map(m => `<code style="font-size:11px;">${escapeHtml(m)}</code>`).join(' ');
     const moreModels = (n.models || []).length > 4
       ? ` <span class="muted">+${n.models.length - 4}</span>`
       : '';
-    const stats = n.stats || {};
-    const reqTotal = fmtNum(stats.requests_total || 0);
-    const tokIn = stats.tokens_in || 0;
-    const tokOut = stats.tokens_out || 0;
-    const tokTotal = fmtNum(tokIn + tokOut);
+    const reqTotal = fmtNum(n.request_count || 0);
+    const tokTotal = fmtNum(n.total_tokens || 0);
 
     const tr = document.createElement('tr');
     tr.innerHTML = `
@@ -185,12 +179,12 @@ function renderNodesTable(nodes) {
       <td><strong>${escapeHtml(n.node_id)}</strong></td>
       <td>${escapeHtml(n.hostname || '-')}${n.ip ? ' <span class="muted">' + escapeHtml(n.ip) + '</span>' : ''}</td>
       <td><code style="font-size:11px;">v${escapeHtml(n.version || '?')}</code></td>
-      <td>${bots}</td>
+      <td>${n.load != null ? n.load.toFixed(2) : '-'}</td>
       <td>${models}${moreModels}</td>
       <td>${reqTotal}</td>
       <td>${tokTotal}</td>
       <td class="muted">${fmtTime(n.started_at)}</td>
-      <td class="muted">${fmtTime(n.last_heartbeat_at)}</td>
+      <td class="muted">${fmtTime(n.last_request_at)}</td>
     `;
     tbody.appendChild(tr);
   });
