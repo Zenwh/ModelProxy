@@ -74,24 +74,31 @@ function logout() {
 async function refresh() {
   hide('keys-table');
   show('keys-loading');
+  show('nodes-loading');
 
   try {
-    const [usage, health] = await Promise.all([
+    const [usage, health, nodes] = await Promise.all([
       api('/admin/usage'),
       api('/health').catch(() => null),
+      api('/admin/nodes').catch(() => ({total: 0, online: 0, nodes: []})),
     ]);
     currentKeys = usage.keys;
-    renderStats(usage, health);
+    renderStats(usage, health, nodes);
     renderKeysTable(usage.keys);
+    renderNodesTable(nodes);
   } catch (e) {
     if (e.message.includes('Invalid') || e.message.includes('Admin')) {
       logout();
     }
     $('keys-loading').textContent = '加载失败：' + e.message;
+    $('nodes-loading').textContent = '加载失败：' + e.message;
   }
 }
 
-function renderStats(usage, health) {
+function renderStats(usage, health, nodes) {
+  $('stat-nodes').textContent = nodes
+    ? `${nodes.online} / ${nodes.total}`
+    : '-';
   const activeCount = usage.keys.filter(k => k.enabled).length;
   $('stat-keys').textContent = `${activeCount} / ${usage.keys.length}`;
   $('stat-requests').textContent = fmtNum(usage.today.requests);
@@ -138,6 +145,58 @@ function renderKeysTable(keys) {
   });
   hide('keys-loading');
   show('keys-table');
+}
+
+// ---- 节点表 ---------------------------------------------------------------
+
+function renderNodesTable(nodes) {
+  const tbody = $('nodes-tbody');
+  tbody.innerHTML = '';
+  const list = nodes?.nodes || [];
+  $('nodes-meta').textContent = nodes ? `共 ${nodes.total} 个节点，在线 ${nodes.online}` : '';
+
+  if (!list.length) {
+    tbody.innerHTML = '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px;">还没有节点上报。先在某台机器装 feishu-relay-bot，并配 center.url</td></tr>';
+    hide('nodes-loading');
+    show('nodes-table');
+    return;
+  }
+
+  list.forEach(n => {
+    const badge = n.status === 'online'
+      ? '<span class="badge ok">online</span>'
+      : (n.status === 'stale'
+        ? '<span class="badge no">stale</span>'
+        : '<span class="badge no">offline</span>');
+    const bots = (n.bots || []).map(b => escapeHtml(b.name || '?')).join(', ') || '<span class="muted">-</span>';
+    const models = (n.models || []).slice(0, 4).map(m => `<code style="font-size:11px;">${escapeHtml(m)}</code>`).join(' ');
+    const moreModels = (n.models || []).length > 4
+      ? ` <span class="muted">+${n.models.length - 4}</span>`
+      : '';
+    const stats = n.stats || {};
+    const reqTotal = fmtNum(stats.requests_total || 0);
+    const tokIn = stats.tokens_in || 0;
+    const tokOut = stats.tokens_out || 0;
+    const tokTotal = fmtNum(tokIn + tokOut);
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${badge}</td>
+      <td><strong>${escapeHtml(n.node_id)}</strong></td>
+      <td>${escapeHtml(n.hostname || '-')}${n.ip ? ' <span class="muted">' + escapeHtml(n.ip) + '</span>' : ''}</td>
+      <td><code style="font-size:11px;">v${escapeHtml(n.version || '?')}</code></td>
+      <td>${bots}</td>
+      <td>${models}${moreModels}</td>
+      <td>${reqTotal}</td>
+      <td>${tokTotal}</td>
+      <td class="muted">${fmtTime(n.started_at)}</td>
+      <td class="muted">${fmtTime(n.last_heartbeat_at)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  hide('nodes-loading');
+  show('nodes-table');
 }
 
 // ---- 详情 -----------------------------------------------------------------

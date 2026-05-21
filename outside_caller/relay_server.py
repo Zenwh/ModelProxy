@@ -24,7 +24,7 @@ import pathlib
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -37,6 +37,7 @@ from .api_keys import KeyInfo, manager as key_mgr
 from .errors import AnthropicError, OpenAIError, error_handler, validation_error_handler
 from .feishu_client import TokenExpiredError, client as feishu
 from .models import is_supported, list_models
+from .nodes import manager as node_mgr
 from .rate_limit import RateLimiter
 from .usage import manager as usage_mgr
 
@@ -87,7 +88,9 @@ def _log_access(
 # 后台 token 刷新
 # ============================================================================
 
-REFRESH_CHECK_INTERVAL = 1800  # 每 30 分钟检查一次
+REFRESH_CHECK_INTERVAL = 1800  # 每 30 分钟检查一次 user_access_token
+NODE_GC_INTERVAL = 60          # 每 60s 检查节点心跳
+NODE_STALE_AFTER_S = 90        # 90s 没心跳标 stale
 
 
 async def _token_refresh_loop():
@@ -98,6 +101,16 @@ async def _token_refresh_loop():
             feishu.maybe_refresh()
         except Exception as e:
             logger.warning("后台 token 刷新失败: %s", e)
+
+
+async def _node_gc_loop():
+    """后台标记长时间没心跳的节点为 stale。"""
+    while True:
+        await asyncio.sleep(NODE_GC_INTERVAL)
+        try:
+            node_mgr.gc_stale(stale_after_s=NODE_STALE_AFTER_S)
+        except Exception as e:
+            logger.warning("节点 GC 失败: %s", e)
 
 
 @asynccontextmanager
@@ -112,14 +125,22 @@ async def _lifespan(app: FastAPI):
         "API Keys: %d 个（%d 活跃）",
         key_mgr.key_count, key_mgr.active_count,
     )
-    task = asyncio.create_task(_token_refresh_loop())
-    logger.info("后台 token 刷新 loop 已启动（间隔 %ds）", REFRESH_CHECK_INTERVAL)
+    logger.info("Nodes: %d 个已知节点", node_mgr.count)
+
+    task_refresh = asyncio.create_task(_token_refresh_loop())
+    task_gc = asyncio.create_task(_node_gc_loop())
+    logger.info(
+        "后台任务已启动：token-refresh(%ds), node-gc(%ds)",
+        REFRESH_CHECK_INTERVAL, NODE_GC_INTERVAL,
+    )
     yield
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
+    task_refresh.cancel()
+    task_gc.cancel()
+    for t in (task_refresh, task_gc):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
@@ -821,6 +842,79 @@ async def admin_usage_summary(request: Request):
     return {
         "today": today,
         "keys": per_key,
+    }
+
+
+# ============================================================================
+# Agent 接口（节点 bot 上报）
+# ============================================================================
+
+
+class HeartbeatRequest(BaseModel):
+    """节点 bot 的心跳上报。"""
+    node_id: str
+    version: Optional[str] = ""
+    hostname: Optional[str] = ""
+    ip: Optional[str] = ""
+    started_at: Optional[str] = ""
+    status: Optional[str] = "online"
+    bots: Optional[List[Dict[str, Any]]] = None
+    models: Optional[List[str]] = None
+    upstream: Optional[Dict[str, Any]] = None
+    stats: Optional[Dict[str, Any]] = None
+
+
+class AgentIdRequest(BaseModel):
+    node_id: str
+
+
+@app.post("/agent/heartbeat")
+async def agent_heartbeat(req: HeartbeatRequest, request: Request):
+    """节点 bot 上报心跳（公开接口，不需要 API key）。"""
+    rec = node_mgr.upsert(req.model_dump(exclude_none=False))
+    return {
+        "status": "ok",
+        "node_id": rec.node_id,
+        "first_seen_at": rec.first_seen_at,
+        "heartbeats_count": rec.heartbeats_count,
+        "center_message": None,
+    }
+
+
+@app.post("/agent/offline")
+async def agent_offline(req: AgentIdRequest):
+    """节点 bot 优雅下线通知。"""
+    ok = node_mgr.mark_offline(req.node_id, reason="client")
+    return {"status": "ok" if ok else "not_found", "node_id": req.node_id}
+
+
+@app.get("/admin/nodes")
+async def admin_list_nodes(request: Request):
+    """Admin 查节点列表。"""
+    _check_admin(request)
+    nodes = node_mgr.list_all()
+    online_count = sum(1 for n in nodes if n.status == "online")
+    return {
+        "total": len(nodes),
+        "online": online_count,
+        "nodes": [
+            {
+                "node_id": n.node_id,
+                "version": n.version,
+                "hostname": n.hostname,
+                "ip": n.ip,
+                "started_at": n.started_at,
+                "first_seen_at": n.first_seen_at,
+                "last_heartbeat_at": n.last_heartbeat_at,
+                "status": n.status,
+                "bots": n.bots,
+                "models": n.models,
+                "upstream": n.upstream,
+                "stats": n.stats,
+                "heartbeats_count": n.heartbeats_count,
+            }
+            for n in nodes
+        ],
     }
 
 

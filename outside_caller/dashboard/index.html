@@ -35,6 +35,10 @@
   <!-- 顶部 stat cards -->
   <section class="stat-grid">
     <div class="stat-card">
+      <div class="stat-label">在线节点</div>
+      <div class="stat-value" id="stat-nodes">-</div>
+    </div>
+    <div class="stat-card">
       <div class="stat-label">活跃 Keys</div>
       <div class="stat-value" id="stat-keys">-</div>
     </div>
@@ -50,6 +54,32 @@
       <div class="stat-label">Token 状态</div>
       <div class="stat-value small" id="stat-token-remaining">-</div>
     </div>
+  </section>
+
+  <!-- 节点列表 -->
+  <section class="card">
+    <div class="card-head">
+      <h2>🖥️ 节点</h2>
+      <span class="muted" id="nodes-meta"></span>
+    </div>
+    <div id="nodes-loading" class="muted">加载中...</div>
+    <table id="nodes-table" class="data-table hidden">
+      <thead>
+        <tr>
+          <th>状态</th>
+          <th>Node</th>
+          <th>Hostname / IP</th>
+          <th>版本</th>
+          <th>Bots</th>
+          <th>能力</th>
+          <th>累计调用</th>
+          <th>累计 Tokens</th>
+          <th>启动时间</th>
+          <th>最近心跳</th>
+        </tr>
+      </thead>
+      <tbody id="nodes-tbody"></tbody>
+    </table>
   </section>
 
   <!-- Keys 列表 -->
