@@ -2,6 +2,11 @@
 Bot Gateway (WebSocket 长连接版)
 ==================================
 
+⚠️  这是 PoC 版本。生产环境推荐使用独立产品仓库：
+    https://github.com/Zenwh/feishu-relay-bot
+    pip install feishu-relay-bot
+    feishu-relay-bot run --config config.yaml
+
 接收 relay 协议的 JSON 消息，路由到 Model Proxy 的对应模型，把响应包装成
 JSON 发回飞书。bot 在内网运行，relay 在外网，通过飞书消息通道穿透 NAT。
 
