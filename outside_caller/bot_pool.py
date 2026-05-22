@@ -315,6 +315,68 @@ class BotPool:
                 logger.warning("给 %s 发 ctrl 失败: %s", node.node_id, e)
         return sent
 
+    # ---- 后台心跳轮询 ----------------------------------------------------------
+
+    def start_heartbeat_poller(self, interval_s: int = 30):
+        """启动后台协程，定时扫描所有 bot chat 的心跳消息。"""
+        self._hb_poll_interval = interval_s
+        self._hb_poll_task: Optional[asyncio.Task] = None
+
+    async def run_heartbeat_poller(self):
+        """后台轮询协程：每隔 interval_s 扫描所有节点的 chat 获取心跳。"""
+        interval = getattr(self, "_hb_poll_interval", 30)
+        logger.info("heartbeat poller started, interval=%ds", interval)
+        while True:
+            try:
+                await self._poll_all_heartbeats()
+            except Exception as e:
+                logger.warning("heartbeat poll error: %s", e)
+            await asyncio.sleep(interval)
+
+    async def _poll_all_heartbeats(self):
+        """扫描所有有 chat_id 的节点，查找心跳消息。"""
+        nodes = [n for n in self.list_all() if n.chat_id]
+        for node in nodes:
+            try:
+                await self._poll_node_heartbeat(node)
+            except TokenExpiredError:
+                logger.warning("token expired during heartbeat poll")
+                break
+            except Exception as e:
+                logger.debug("poll heartbeat for %s failed: %s", node.node_id, e)
+
+    async def _poll_node_heartbeat(self, node: BotNode):
+        """扫描单个节点的 chat，解析心跳消息。"""
+        async with httpx.AsyncClient(timeout=15) as cli:
+            r = await cli.get(
+                f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
+                params={
+                    "container_id_type": "chat",
+                    "container_id": node.chat_id,
+                    "sort_type": "ByCreateTimeDesc",
+                    "page_size": 5,
+                },
+                headers=token_mgr.auth_header(),
+            )
+        d = r.json()
+        if d.get("code") != 0:
+            return
+
+        for m in (d.get("data") or {}).get("items") or []:
+            sender_type = (m.get("sender") or {}).get("sender_type", "")
+            if sender_type != "app":
+                continue
+            text = _extract_text(m)
+            try:
+                parsed = codec_decode(text)
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            if parsed.get("_relay_v") == 2 and parsed.get("type") == "heartbeat":
+                self.register(parsed)
+                break  # 只取最近一条心跳即可
+
 
 def _extract_text(msg: dict) -> str:
     """从飞书消息结构提取纯文本。"""

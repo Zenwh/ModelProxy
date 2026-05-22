@@ -117,11 +117,17 @@ async def _lifespan(app: FastAPI):
     logger.info("Bot Pool: %d 个节点", bot_pool.count)
 
     task_refresh = asyncio.create_task(_token_refresh_loop())
-    logger.info("后台任务已启动：token-refresh(%ds)", REFRESH_CHECK_INTERVAL)
+    task_hb_poll = asyncio.create_task(bot_pool.run_heartbeat_poller())
+    logger.info("后台任务已启动：token-refresh(%ds), heartbeat-poller(30s)", REFRESH_CHECK_INTERVAL)
     yield
     task_refresh.cancel()
+    task_hb_poll.cancel()
     try:
         await task_refresh
+    except asyncio.CancelledError:
+        pass
+    try:
+        await task_hb_poll
     except asyncio.CancelledError:
         pass
 
