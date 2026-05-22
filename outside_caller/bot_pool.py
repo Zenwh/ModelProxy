@@ -189,6 +189,20 @@ class BotPool:
             except StopIteration:
                 return None
 
+    def remove(self, node_id: str) -> None:
+        """移除一个 bot 节点（下线）。也移除其子节点。"""
+        with self._lock:
+            removed = node_id in self._nodes
+            self._nodes.pop(node_id, None)
+            prefix = f"{node_id}/"
+            to_del = [k for k in self._nodes if k.startswith(prefix)]
+            for k in to_del:
+                del self._nodes[k]
+            if removed or to_del:
+                self._rr_dirty = True
+                self._save()
+                logger.info("节点下线: %s (+%d 子节点)", node_id, len(to_del))
+
     def get(self, node_id: str) -> Optional[BotNode]:
         return self._nodes.get(node_id)
 
