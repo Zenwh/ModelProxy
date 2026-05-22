@@ -1,8 +1,11 @@
 """
-Bot 路由池：维护多个 bot 节点，支持负载均衡选择、心跳更新、故障摘除。
+Bot 路由池：维护多个 bot 节点，round-robin 负载均衡。
 
-Gateway 通过飞书 REST API 给选中的 bot 发消息（下行），
-通过轮询飞书消息收 bot 回复（上行），在轮询过程中顺带解析心跳。
+所有 Gateway ↔ Bot 通信通过飞书消息完成：
+  - Gateway → Bot：飞书 REST API 发消息（下行）
+  - Bot → Gateway：轮询飞书消息收回复（上行）
+
+心跳仅作为参考信息（版本、负载等），不影响路由判断。
 """
 from __future__ import annotations
 
@@ -21,10 +24,9 @@ import httpx
 
 from . import config
 from .feishu_token import TokenExpiredError, token_mgr
+from .relay_codec import PayloadTooLargeError, decode as codec_decode, encode as codec_encode
 
 logger = logging.getLogger("bot-pool")
-
-STALE_AFTER_S = 90
 
 
 def _now_iso() -> str:
@@ -40,35 +42,35 @@ class BotNode:
     version: str = ""
     hostname: str = ""
     ip: str = ""
-    status: str = "online"          # online | stale | offline
-    load: float = 0.0               # 0.0-1.0
+    load: float = 0.0
     models: List[str] = field(default_factory=list)
     started_at: str = ""
-    last_heartbeat_at: str = ""
+    last_request_at: str = ""
     first_seen_at: str = ""
-    heartbeats_count: int = 0
-    active_requests: int = 0        # 当前正在处理的请求数
+    request_count: int = 0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+    capabilities: List[str] = field(default_factory=list)
 
 
 class BotPool:
     """
     多 bot 路由池。
 
-    - upsert_heartbeat(): 心跳更新节点状态
-    - select(): round-robin 选一个在线 bot
+    - select(): round-robin 选一个 bot
+    - record_request(): 每次请求时记录时间
     - send_to_bot(): 给指定 bot 发飞书消息
-    - poll_reply(): 按 req_id 轮询 bot 回复（顺带解析心跳）
-    - gc_stale(): 标记超时节点
+    - poll_reply(): 按 req_id 轮询 bot 回复
     """
 
     def __init__(self, file_path: Optional[str] = None):
         self._file = file_path or os.path.join(config.STATE_DIR, "bot_pool.json")
         self._nodes: Dict[str, BotNode] = {}
         self._lock = threading.Lock()
-        self._rr = itertools.cycle([])  # round-robin iterator
+        self._rr = itertools.cycle([])
         self._rr_dirty = True
         self._load()
-        # 兼容：如果配置了旧的单 bot，自动注册为 legacy 节点
         self._ensure_legacy_bot()
 
     # ---- 持久化 ---------------------------------------------------------------
@@ -84,6 +86,9 @@ class BotPool:
             return
         for nid, rec in data.get("nodes", {}).items():
             rec.pop("active_requests", None)
+            rec.pop("status", None)
+            rec.pop("heartbeats_count", None)
+            rec.pop("last_heartbeat_at", None)
             self._nodes[nid] = BotNode(**rec)
         self._rr_dirty = True
         logger.info("加载 %d 个 bot 节点", len(self._nodes))
@@ -97,48 +102,43 @@ class BotPool:
             )
 
     def _ensure_legacy_bot(self):
-        """兼容旧配置：如果 BOT_OPEN_ID 和 CHAT_ID 存在，注册为 legacy 节点。"""
+        """兼容旧配置：BOT_OPEN_ID + CHAT_ID 存在时注册为 legacy 节点。"""
         if not config.BOT_OPEN_ID or not config.CHAT_ID:
             return
         legacy_id = "legacy-default"
-        if legacy_id in self._nodes:
-            return
         with self._lock:
+            if legacy_id in self._nodes:
+                return
             self._nodes[legacy_id] = BotNode(
                 node_id=legacy_id,
                 open_id=config.BOT_OPEN_ID,
                 chat_id=config.CHAT_ID,
-                status="online",
                 first_seen_at=_now_iso(),
-                last_heartbeat_at=_now_iso(),
             )
             self._rr_dirty = True
             self._save()
             logger.info("注册 legacy bot: open_id=%s chat_id=%s", config.BOT_OPEN_ID, config.CHAT_ID)
 
-    # ---- 心跳 -----------------------------------------------------------------
+    # ---- 节点管理 ---------------------------------------------------------------
 
-    def upsert_heartbeat(self, payload: Dict[str, Any]) -> BotNode:
-        """Bot 心跳上报（从飞书消息解析或 HTTP 接口）。"""
+    def register(self, payload: Dict[str, Any]) -> BotNode:
+        """注册或更新一个 bot 节点（从飞书心跳消息解析）。"""
         node_id = payload.get("node_id")
         if not node_id:
-            raise ValueError("missing node_id in heartbeat")
+            raise ValueError("missing node_id")
 
         with self._lock:
-            now = _now_iso()
             existing = self._nodes.get(node_id)
             if existing:
-                existing.version = payload.get("version", existing.version)
-                existing.hostname = payload.get("hostname", existing.hostname)
-                existing.ip = payload.get("ip", existing.ip)
-                existing.open_id = payload.get("open_id", existing.open_id)
-                existing.chat_id = payload.get("chat_id", existing.chat_id)
-                existing.started_at = payload.get("started_at", existing.started_at)
-                existing.last_heartbeat_at = now
-                existing.status = "online"
-                existing.load = payload.get("load", 0.0)
-                existing.models = payload.get("models", existing.models)
-                existing.heartbeats_count += 1
+                existing.version = payload.get("version") or existing.version
+                existing.hostname = payload.get("hostname") or existing.hostname
+                existing.ip = payload.get("ip") or existing.ip
+                existing.open_id = payload.get("open_id") or existing.open_id
+                existing.chat_id = payload.get("chat_id") or existing.chat_id
+                existing.load = payload.get("load", existing.load)
+                existing.models = payload.get("models") or existing.models
+                existing.started_at = payload.get("started_at") or existing.started_at
+                existing.capabilities = payload.get("capabilities") or existing.capabilities
                 node = existing
             else:
                 node = BotNode(
@@ -148,13 +148,9 @@ class BotPool:
                     version=payload.get("version", ""),
                     hostname=payload.get("hostname", ""),
                     ip=payload.get("ip", ""),
-                    started_at=payload.get("started_at", ""),
-                    last_heartbeat_at=now,
-                    status="online",
                     load=payload.get("load", 0.0),
                     models=payload.get("models", []),
-                    first_seen_at=now,
-                    heartbeats_count=1,
+                    first_seen_at=_now_iso(),
                 )
                 self._nodes[node_id] = node
                 logger.info("新 bot 注册: %s (open_id=%s)", node_id, node.open_id)
@@ -162,48 +158,29 @@ class BotPool:
             self._save()
             return node
 
-    def mark_offline(self, node_id: str, reason: str = "client") -> bool:
+    def record_request(self, node: BotNode):
+        """每次请求时记录。"""
         with self._lock:
-            node = self._nodes.get(node_id)
-            if not node:
-                return False
-            node.status = "offline"
-            node.last_heartbeat_at = _now_iso()
-            self._rr_dirty = True
-            self._save()
-            logger.info("bot %s 下线（%s）", node_id, reason)
-            return True
+            node.last_request_at = _now_iso()
+            node.request_count += 1
 
-    def gc_stale(self, stale_after_s: int = STALE_AFTER_S) -> int:
-        n = 0
+    def record_usage(self, node: BotNode, prompt_tokens: int, completion_tokens: int):
+        """请求成功后记录 token 用量。"""
         with self._lock:
-            now_t = time.time()
-            for node in self._nodes.values():
-                if node.status != "online":
-                    continue
-                try:
-                    last_t = datetime.fromisoformat(node.last_heartbeat_at).timestamp()
-                except Exception:
-                    continue
-                if now_t - last_t > stale_after_s:
-                    node.status = "stale"
-                    n += 1
-            if n > 0:
-                self._rr_dirty = True
-                self._save()
-                logger.info("GC: %d 个 bot 标记为 stale", n)
-        return n
+            node.total_prompt_tokens += prompt_tokens
+            node.total_completion_tokens += completion_tokens
+            node.total_tokens += prompt_tokens + completion_tokens
+            self._save()
 
     # ---- 路由选择 --------------------------------------------------------------
 
     def _rebuild_rr(self):
-        online = [n for n in self._nodes.values()
-                  if n.status == "online" and n.open_id and n.chat_id]
-        self._rr = itertools.cycle(online) if online else itertools.cycle([])
+        available = [n for n in self._nodes.values() if n.chat_id]
+        self._rr = itertools.cycle(available) if available else itertools.cycle([])
         self._rr_dirty = False
 
     def select(self) -> Optional[BotNode]:
-        """Round-robin 选一个在线 bot。无可用节点返回 None。"""
+        """Round-robin 选一个 bot。无可用节点返回 None。"""
         with self._lock:
             if self._rr_dirty:
                 self._rebuild_rr()
@@ -218,25 +195,23 @@ class BotPool:
     def list_all(self) -> List[BotNode]:
         return sorted(
             self._nodes.values(),
-            key=lambda n: n.last_heartbeat_at,
+            key=lambda n: n.last_request_at or n.first_seen_at,
             reverse=True,
         )
-
-    def list_online(self) -> List[BotNode]:
-        return [n for n in self.list_all() if n.status == "online"]
 
     @property
     def count(self) -> int:
         return len(self._nodes)
 
-    @property
-    def online_count(self) -> int:
-        return sum(1 for n in self._nodes.values() if n.status == "online")
-
     # ---- 飞书消息收发 ----------------------------------------------------------
 
-    async def send_to_bot(self, node: BotNode, text: str) -> dict:
-        """通过飞书 REST API 给指定 bot 发消息。"""
+    async def send_to_bot(self, node: BotNode, payload, *, allow_compress: bool = True) -> dict:
+        """通过飞书 REST API 给指定 bot 发消息。payload 可以是 dict 或已编码 str。"""
+        if isinstance(payload, dict):
+            can_compress = allow_compress and ("zlib" in (node.capabilities or []))
+            text = codec_encode(payload, allow_compress=can_compress)
+        else:
+            text = payload
         async with httpx.AsyncClient(timeout=15) as cli:
             r = await cli.post(
                 f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
@@ -260,7 +235,7 @@ class BotPool:
         after_ms: int,
         timeout_s: Optional[int] = None,
     ) -> Optional[dict]:
-        """轮询指定 bot 会话，按 req_id 匹配响应。顺带解析心跳消息。"""
+        """轮询指定 bot 会话，按 req_id 匹配响应。"""
         timeout_s = timeout_s or config.POLL_TIMEOUT_S
         deadline = time.time() + timeout_s
         interval = config.POLL_INTERVAL_S
@@ -286,8 +261,6 @@ class BotPool:
 
             for m in (d.get("data") or {}).get("items") or []:
                 ct = int(m.get("create_time", "0"))
-                if ct <= after_ms:
-                    continue
                 sender_type = (m.get("sender") or {}).get("sender_type", "")
                 if sender_type != "app":
                     continue
@@ -298,15 +271,19 @@ class BotPool:
 
                 text = _extract_text(m)
                 try:
-                    parsed = json.loads(text)
-                except (ValueError, TypeError):
+                    parsed = codec_decode(text)
+                except (ValueError, TypeError, Exception):
                     continue
                 if not isinstance(parsed, dict):
                     continue
 
-                # 顺带处理心跳
+                # 心跳不受时间过滤，随时更新节点信息
                 if parsed.get("_relay_v") == 2 and parsed.get("type") == "heartbeat":
-                    self.upsert_heartbeat(parsed)
+                    self.register(parsed)
+                    continue
+
+                # 响应消息只看请求之后的
+                if ct <= after_ms:
                     continue
 
                 if parsed.get("req_id") == req_id:
@@ -316,25 +293,89 @@ class BotPool:
         return None
 
     async def send_ctrl(self, node: BotNode, action: str, **kwargs) -> dict:
-        """给指定 bot 发管控指令。"""
+        """给指定 bot 发管控指令（通过飞书消息）。"""
         payload = {
             "_relay_v": 2,
             "type": "ctrl",
             "action": action,
             **kwargs,
         }
-        return await self.send_to_bot(node, json.dumps(payload, ensure_ascii=False))
+        return await self.send_to_bot(node, payload, allow_compress=False)
 
     async def broadcast_ctrl(self, action: str, **kwargs) -> List[str]:
-        """给所有在线 bot 广播管控指令。返回成功发送的 node_id 列表。"""
+        """给所有 bot 广播管控指令。"""
         sent = []
-        for node in self.list_online():
+        for node in self.list_all():
+            if not node.open_id or not node.chat_id:
+                continue
             try:
                 await self.send_ctrl(node, action, **kwargs)
                 sent.append(node.node_id)
             except Exception as e:
                 logger.warning("给 %s 发 ctrl 失败: %s", node.node_id, e)
         return sent
+
+    # ---- 后台心跳轮询 ----------------------------------------------------------
+
+    def start_heartbeat_poller(self, interval_s: int = 30):
+        """启动后台协程，定时扫描所有 bot chat 的心跳消息。"""
+        self._hb_poll_interval = interval_s
+        self._hb_poll_task: Optional[asyncio.Task] = None
+
+    async def run_heartbeat_poller(self):
+        """后台轮询协程：每隔 interval_s 扫描所有节点的 chat 获取心跳。"""
+        interval = getattr(self, "_hb_poll_interval", 30)
+        logger.info("heartbeat poller started, interval=%ds", interval)
+        while True:
+            try:
+                await self._poll_all_heartbeats()
+            except Exception as e:
+                logger.warning("heartbeat poll error: %s", e)
+            await asyncio.sleep(interval)
+
+    async def _poll_all_heartbeats(self):
+        """扫描所有有 chat_id 的节点，查找心跳消息。"""
+        nodes = [n for n in self.list_all() if n.chat_id]
+        for node in nodes:
+            try:
+                await self._poll_node_heartbeat(node)
+            except TokenExpiredError:
+                logger.warning("token expired during heartbeat poll")
+                break
+            except Exception as e:
+                logger.debug("poll heartbeat for %s failed: %s", node.node_id, e)
+
+    async def _poll_node_heartbeat(self, node: BotNode):
+        """扫描单个节点的 chat，解析心跳消息。"""
+        async with httpx.AsyncClient(timeout=15) as cli:
+            r = await cli.get(
+                f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
+                params={
+                    "container_id_type": "chat",
+                    "container_id": node.chat_id,
+                    "sort_type": "ByCreateTimeDesc",
+                    "page_size": 5,
+                },
+                headers=token_mgr.auth_header(),
+            )
+        d = r.json()
+        if d.get("code") != 0:
+            return
+
+        for m in (d.get("data") or {}).get("items") or []:
+            sender_type = (m.get("sender") or {}).get("sender_type", "")
+            if sender_type != "app":
+                continue
+            text = _extract_text(m)
+            try:
+                parsed = codec_decode(text)
+            except Exception:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            if parsed.get("_relay_v") == 2 and parsed.get("type") == "heartbeat":
+                self.register(parsed)
+                break  # 只取最近一条心跳即可
 
 
 def _extract_text(msg: dict) -> str:
@@ -359,9 +400,7 @@ def _extract_text(msg: dict) -> str:
                 elif tag == "a":
                     line_parts.append(seg.get("text", seg.get("href", "")))
                 elif tag == "code_block":
-                    lang = seg.get("language", "")
-                    code = seg.get("text", "")
-                    line_parts.append(f"```{lang}\n{code}\n```")
+                    line_parts.append(seg.get("text", ""))
             parts.append("".join(line_parts))
         return "\n".join(parts)
     elif msg_type == "interactive":

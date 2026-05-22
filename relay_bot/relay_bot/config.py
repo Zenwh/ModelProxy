@@ -23,6 +23,10 @@ class Config:
     # 节点标识
     node_id: str = ""
 
+    # Gateway 通信
+    chat_id: str = ""
+    open_id: str = ""
+
     # 心跳
     heartbeat_interval_s: int = 30
 
@@ -40,6 +44,8 @@ class Config:
                 "mp_url": mp.get("url", ""),
                 "mp_api_key": mp.get("api_key", ""),
                 "node_id": raw.get("node_id", ""),
+                "chat_id": raw.get("chat_id", ""),
+                "open_id": raw.get("open_id", ""),
                 "heartbeat_interval_s": raw.get("heartbeat_interval_s", 30),
             }
 
@@ -49,6 +55,8 @@ class Config:
             mp_url=os.getenv("MP_URL", data.get("mp_url", "http://localhost:8000")),
             mp_api_key=os.getenv("MP_API_KEY", data.get("mp_api_key", "")),
             node_id=os.getenv("NODE_ID", data.get("node_id", "")),
+            chat_id=os.getenv("CHAT_ID", data.get("chat_id", "")),
+            open_id=os.getenv("BOT_OPEN_ID", data.get("open_id", "")),
             heartbeat_interval_s=int(os.getenv("HEARTBEAT_INTERVAL_S", data.get("heartbeat_interval_s", 30))),
         )
 

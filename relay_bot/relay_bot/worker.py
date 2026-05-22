@@ -16,6 +16,7 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
 from . import __version__
 from .config import Config
+from .relay_codec import PayloadTooLargeError, decode as codec_decode, encode as codec_encode
 
 logger = logging.getLogger("relay-bot")
 
@@ -27,6 +28,7 @@ class Worker:
         self._ws_client = None
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._running = False
+        self.chat_id: Optional[str] = cfg.chat_id or None
 
     def start(self):
         """启动 bot：连接飞书 WS，开始接收消息。"""
@@ -76,7 +78,14 @@ class Worker:
         payload["_relay_v"] = 2
         payload["type"] = "resp"
         payload["node_id"] = self.cfg.node_id
-        text = json.dumps(payload, ensure_ascii=False)
+        try:
+            text = codec_encode(payload)
+        except PayloadTooLargeError:
+            payload.pop("raw_anthropic", None)
+            if "content" in payload:
+                payload["content"] = payload["content"][:8000] + "\n...[truncated]"
+            payload["finish_reason"] = "length"
+            text = codec_encode(payload, allow_compress=False)
         self.reply_text(chat_id, text)
 
     def _on_message(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -91,9 +100,12 @@ class Worker:
         raw_text = content.get("text", "")
         chat_id = msg.chat_id
 
+        if not self.chat_id:
+            self.chat_id = chat_id
+
         try:
-            parsed = json.loads(raw_text)
-        except (ValueError, TypeError):
+            parsed = codec_decode(raw_text)
+        except (ValueError, TypeError, Exception):
             return
         if not isinstance(parsed, dict):
             return
@@ -120,7 +132,7 @@ class Worker:
         """处理 AI 请求：调 MP，返回结果。"""
         req_id = req.get("req_id", "")
         model = req.get("model", "")
-        endpoint = req.get("endpoint", "chat")
+        endpoint = req.get("endpoint") or ("messages" if req.get("mode") == "messages_native" else "chat")
 
         logger.info("← req_id=%s model=%s endpoint=%s", req_id, model, endpoint)
 
@@ -177,7 +189,41 @@ class Worker:
         model = req.get("model", "")
         messages = req.get("messages", [])
         endpoint = req.get("endpoint", "chat")
-        payload: dict[str, Any] = {
+
+        if endpoint == "responses":
+            payload: dict[str, Any] = {
+                "model": model,
+                "input": messages,
+                "stream": False,
+            }
+            if req.get("max_tokens"):
+                payload["max_tokens"] = req["max_tokens"]
+            if req.get("temperature") is not None:
+                payload["temperature"] = req["temperature"]
+
+            status, data = self._mp_post("/v1/responses", payload)
+            if status != 200:
+                return status, data
+
+            output = data.get("output") or []
+            content = ""
+            for item in output:
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if c.get("type") == "output_text":
+                            content += c.get("text", "")
+            usage = data.get("usage") or {}
+            return 200, {
+                "content": content,
+                "finish_reason": "stop",
+                "usage": {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                },
+            }
+
+        payload = {
             "model": model,
             "messages": messages,
             "stream": False,
@@ -187,8 +233,7 @@ class Worker:
         if req.get("temperature") is not None:
             payload["temperature"] = req["temperature"]
 
-        path = "/v1/responses" if endpoint == "responses" else "/v1/chat/completions"
-        status, data = self._mp_post(path, payload)
+        status, data = self._mp_post("/v1/chat/completions", payload)
         if status != 200:
             return status, data
 

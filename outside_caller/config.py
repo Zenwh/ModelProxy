@@ -26,8 +26,8 @@ MODELPROXY_BASE = os.getenv("MODELPROXY_BASE", "https://models-proxy.stepfun-inc
 MODELPROXY_API_KEY = os.getenv("MODELPROXY_API_KEY", "ak-c9pttfhr2xoxrwuo4a7hvtd91h7zfedh")
 
 # 目标 bot（阿月老师）
-BOT_OPEN_ID = os.getenv("BOT_OPEN_ID", "ou_62bd50151cb45ff8fa60f2c9920ba17b")
-CHAT_ID = os.getenv("CHAT_ID", "oc_1b306e7ee93a675a6bae0c5b46aa28c4")
+BOT_OPEN_ID = os.getenv("BOT_OPEN_ID", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
 
 # Relay 服务
 RELAY_HOST = os.getenv("RELAY_HOST", "0.0.0.0")
