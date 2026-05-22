@@ -24,6 +24,7 @@ import httpx
 
 from . import config
 from .feishu_token import TokenExpiredError, token_mgr
+from .relay_codec import PayloadTooLargeError, decode as codec_decode, encode as codec_encode
 
 logger = logging.getLogger("bot-pool")
 
@@ -50,6 +51,7 @@ class BotNode:
     total_prompt_tokens: int = 0
     total_completion_tokens: int = 0
     total_tokens: int = 0
+    capabilities: List[str] = field(default_factory=list)
 
 
 class BotPool:
@@ -136,6 +138,7 @@ class BotPool:
                 existing.load = payload.get("load", existing.load)
                 existing.models = payload.get("models") or existing.models
                 existing.started_at = payload.get("started_at") or existing.started_at
+                existing.capabilities = payload.get("capabilities") or existing.capabilities
                 node = existing
             else:
                 node = BotNode(
@@ -202,8 +205,13 @@ class BotPool:
 
     # ---- 飞书消息收发 ----------------------------------------------------------
 
-    async def send_to_bot(self, node: BotNode, text: str) -> dict:
-        """通过飞书 REST API 给指定 bot 发消息。"""
+    async def send_to_bot(self, node: BotNode, payload, *, allow_compress: bool = True) -> dict:
+        """通过飞书 REST API 给指定 bot 发消息。payload 可以是 dict 或已编码 str。"""
+        if isinstance(payload, dict):
+            can_compress = allow_compress and ("zlib" in (node.capabilities or []))
+            text = codec_encode(payload, allow_compress=can_compress)
+        else:
+            text = payload
         async with httpx.AsyncClient(timeout=15) as cli:
             r = await cli.post(
                 f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
@@ -263,8 +271,8 @@ class BotPool:
 
                 text = _extract_text(m)
                 try:
-                    parsed = json.loads(text)
-                except (ValueError, TypeError):
+                    parsed = codec_decode(text)
+                except (ValueError, TypeError, Exception):
                     continue
                 if not isinstance(parsed, dict):
                     continue
@@ -292,7 +300,7 @@ class BotPool:
             "action": action,
             **kwargs,
         }
-        return await self.send_to_bot(node, json.dumps(payload, ensure_ascii=False))
+        return await self.send_to_bot(node, payload, allow_compress=False)
 
     async def broadcast_ctrl(self, action: str, **kwargs) -> List[str]:
         """给所有 bot 广播管控指令。"""

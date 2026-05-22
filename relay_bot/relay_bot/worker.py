@@ -16,6 +16,7 @@ from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
 from . import __version__
 from .config import Config
+from .relay_codec import PayloadTooLargeError, decode as codec_decode, encode as codec_encode
 
 logger = logging.getLogger("relay-bot")
 
@@ -77,7 +78,14 @@ class Worker:
         payload["_relay_v"] = 2
         payload["type"] = "resp"
         payload["node_id"] = self.cfg.node_id
-        text = json.dumps(payload, ensure_ascii=False)
+        try:
+            text = codec_encode(payload)
+        except PayloadTooLargeError:
+            payload.pop("raw_anthropic", None)
+            if "content" in payload:
+                payload["content"] = payload["content"][:8000] + "\n...[truncated]"
+            payload["finish_reason"] = "length"
+            text = codec_encode(payload, allow_compress=False)
         self.reply_text(chat_id, text)
 
     def _on_message(self, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
@@ -96,8 +104,8 @@ class Worker:
             self.chat_id = chat_id
 
         try:
-            parsed = json.loads(raw_text)
-        except (ValueError, TypeError):
+            parsed = codec_decode(raw_text)
+        except (ValueError, TypeError, Exception):
             return
         if not isinstance(parsed, dict):
             return

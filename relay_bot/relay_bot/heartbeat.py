@@ -40,6 +40,7 @@ def _build_heartbeat(worker: "Worker") -> dict:
             "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6",
             "gpt-5.5", "gpt-5.4", "kimi-k2.6", "glm-5.1",
         ],
+        "capabilities": ["zlib"],
     }
 
 

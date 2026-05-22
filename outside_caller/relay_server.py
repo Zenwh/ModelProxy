@@ -39,6 +39,7 @@ from .errors import AnthropicError, OpenAIError, error_handler, validation_error
 from .feishu_token import TokenExpiredError, token_mgr
 from .models import is_supported, list_models, to_mp_name, to_endpoint
 from .rate_limit import RateLimiter
+from .relay_codec import PayloadTooLargeError
 from .usage import manager as usage_mgr
 
 logging.basicConfig(
@@ -354,7 +355,16 @@ async def chat_completions(req: ChatRequest, request: Request):
 
     # 发 JSON 消息到 bot
     try:
-        await bot_pool.send_to_bot(node, json.dumps(payload, ensure_ascii=False))
+        await bot_pool.send_to_bot(node, payload)
+    except PayloadTooLargeError as e:
+        usage_mgr.record_failed(key_info.name, req.model)
+        _log_access(key_info.name, req.model, 413, time.time() - t0, last_user)
+        raise OpenAIError(
+            "invalid_request_error",
+            f"Request payload ({e.size_kb:.0f}KB) exceeds relay tunnel limit. "
+            f"Reduce conversation history or system prompt.",
+            status=413, param="messages",
+        )
     except TokenExpiredError as e:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 401, time.time() - t0, last_user)
@@ -577,7 +587,16 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
 
     # 4. 发飞书 + 轮询
     try:
-        await bot_pool.send_to_bot(node, json.dumps(payload, ensure_ascii=False))
+        await bot_pool.send_to_bot(node, payload)
+    except PayloadTooLargeError as e:
+        usage_mgr.record_failed(key_info.name, req.model)
+        _log_access(key_info.name, req.model, 413, time.time() - t0, last_user)
+        raise AnthropicError(
+            "invalid_request_error",
+            f"Request payload ({e.size_kb:.0f}KB) exceeds relay tunnel capacity. "
+            f"Reduce messages or tool definitions.",
+            status=413,
+        )
     except TokenExpiredError as e:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 401, time.time() - t0, last_user)
