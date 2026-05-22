@@ -55,8 +55,8 @@ from outside_caller.models import to_mp_name, to_endpoint, is_supported  # noqa:
 APP_ID = os.getenv("FEISHU_APP_ID", "cli_a955f5aa04f81bda")
 APP_SECRET = os.getenv("FEISHU_APP_SECRET", "WgVfCkJcdggcJqkoJDVKB6YkL2JqoT16")
 
-MODELPROXY_BASE = os.getenv("MODELPROXY_BASE", "https://models-proxy.stepfun-inc.com").rstrip("/")
-MODELPROXY_API_KEY = os.getenv("MODELPROXY_API_KEY", "ak-c9pttfhr2xoxrwuo4a7hvtd91h7zfedh")
+MODELPROXY_BASE = os.getenv("MODELPROXY_BASE", "https://memopalace-prod.stepfun-inc.com").rstrip("/")
+MODELPROXY_API_KEY = os.getenv("MODELPROXY_API_KEY", "")  # 可选；memopalace 内网默认无鉴权
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,13 +72,13 @@ DEFAULT_MAX_TOKENS = 4096  # /v1/messages 要求 max_tokens 必填
 
 def _mp_post(path: str, payload: dict) -> tuple[int, dict]:
     """通用 MP POST。"""
+    headers = {"Content-Type": "application/json"}
+    if MODELPROXY_API_KEY:
+        headers["Authorization"] = f"Bearer {MODELPROXY_API_KEY}"
     with httpx.Client(timeout=240) as cli:
         r = cli.post(
             f"{MODELPROXY_BASE}{path}",
-            headers={
-                "Authorization": f"Bearer {MODELPROXY_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers=headers,
             json=payload,
         )
     try:

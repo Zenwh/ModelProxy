@@ -4,7 +4,9 @@ feishu:
   app_secret: your_app_secret_here
 
 mp:
-  url: http://mp.internal:8000
+  # memopalace（MP 代理）；测试环境 https://memopalace-test.stepfun-inc.net
+  url: https://memopalace-prod.stepfun-inc.com
+  # api_key: ""              # 可选；内网默认无鉴权，配置后会带 Authorization: Bearer
 
 # 可选
 node_id: ""                  # 空则自动用 hostname

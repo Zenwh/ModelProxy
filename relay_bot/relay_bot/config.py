@@ -16,9 +16,9 @@ class Config:
     feishu_app_id: str = ""
     feishu_app_secret: str = ""
 
-    # Model Proxy
-    mp_url: str = "http://localhost:8000"
-    mp_api_key: str = ""
+    # Model Proxy（memopalace 作为 MP 代理，详见 docs/memopalace-contract.md）
+    mp_url: str = "https://memopalace-prod.stepfun-inc.com"
+    mp_api_key: str = ""   # 可选；memopalace v1.0 内网默认无鉴权，配置了才会带 Authorization
 
     # 节点标识
     node_id: str = ""
@@ -52,7 +52,7 @@ class Config:
         cfg = cls(
             feishu_app_id=os.getenv("FEISHU_APP_ID", data.get("feishu_app_id", "")),
             feishu_app_secret=os.getenv("FEISHU_APP_SECRET", data.get("feishu_app_secret", "")),
-            mp_url=os.getenv("MP_URL", data.get("mp_url", "http://localhost:8000")),
+            mp_url=os.getenv("MP_URL", data.get("mp_url", "https://memopalace-prod.stepfun-inc.com")),
             mp_api_key=os.getenv("MP_API_KEY", data.get("mp_api_key", "")),
             node_id=os.getenv("NODE_ID", data.get("node_id", "")),
             chat_id=os.getenv("CHAT_ID", data.get("chat_id", "")),
