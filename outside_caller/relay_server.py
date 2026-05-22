@@ -1007,6 +1007,54 @@ async def admin_upgrade_all(req: CtrlRequest, request: Request):
 
 
 # ============================================================================
+# Agent 心跳上报（Bot HTTP push 模式）
+# ============================================================================
+
+
+@app.post("/agent/heartbeat")
+async def agent_heartbeat(request: Request):
+    """Bot 主动上报心跳，注册/更新节点。"""
+    body = await request.json()
+    node_id = body.get("node_id")
+    if not node_id:
+        raise HTTPException(400, "missing node_id")
+
+    bots = body.get("bots") or []
+    if bots:
+        for b in bots:
+            bid = b.get("name") or b.get("app_id", "")
+            sub_node_id = f"{node_id}/{bid}" if bid else node_id
+            bot_pool.register({
+                "node_id": sub_node_id,
+                "open_id": b.get("open_id", ""),
+                "chat_id": b.get("chat_id", ""),
+                "version": body.get("version", ""),
+                "hostname": body.get("hostname", ""),
+                "ip": body.get("ip", ""),
+                "models": body.get("models", []),
+                "started_at": body.get("started_at", ""),
+                "capabilities": body.get("capabilities", []),
+            })
+    else:
+        bot_pool.register(body)
+
+    logger.info("heartbeat from %s, bots=%d", node_id, len(bots) or 1)
+    return {"status": "ok"}
+
+
+@app.post("/agent/offline")
+async def agent_offline(request: Request):
+    """Bot 主动下线通知。"""
+    body = await request.json()
+    node_id = body.get("node_id")
+    if not node_id:
+        raise HTTPException(400, "missing node_id")
+    bot_pool.remove(node_id)
+    logger.info("offline from %s", node_id)
+    return {"status": "ok"}
+
+
+# ============================================================================
 # Dashboard
 # ============================================================================
 
