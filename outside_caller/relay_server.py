@@ -37,7 +37,7 @@ from .api_keys import KeyInfo, manager as key_mgr
 from .bot_pool import pool as bot_pool
 from .errors import AnthropicError, OpenAIError, error_handler, validation_error_handler
 from .feishu_token import TokenExpiredError, token_mgr
-from .models import is_supported, list_models, to_mp_name, to_endpoint
+from .models import is_supported, list_models, to_endpoint
 from .rate_limit import RateLimiter
 from .relay_codec import PayloadTooLargeError
 from .usage import manager as usage_mgr
@@ -319,8 +319,8 @@ async def chat_completions(req: ChatRequest, request: Request):
             break
 
     # 构造 relay 协议 payload
+    # model 传 public 名透传给 bot，由 bot 端 ModelRegistry 翻译成上游名 + 路由到对应 endpoint
     req_id = uuid.uuid4().hex[:24]
-    mp_model = to_mp_name(req.model) or req.model
     endpoint = to_endpoint(req.model) or "chat"
 
     logger.info("→ [%s] [%s] req_id=%s msgs=%d stream=%s last=%s",
@@ -343,7 +343,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             "_relay_v": 2,
             "type": "req",
             "req_id": req_id,
-            "model": mp_model,
+            "model": req.model,
             "endpoint": endpoint,
             "messages": [m.model_dump() for m in req.messages],
         }
@@ -351,7 +351,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         payload = {
             "_relay_v": 1,
             "req_id": req_id,
-            "model": mp_model,
+            "model": req.model,
             "messages": [m.model_dump() for m in req.messages],
         }
     if req.temperature is not None:

@@ -317,10 +317,10 @@ class BotPool:
         return await self.send_to_bot(node, payload, allow_compress=False)
 
     async def broadcast_ctrl(self, action: str, **kwargs) -> List[str]:
-        """给所有 bot 广播管控指令。"""
+        """给所有 bot 广播管控指令。只要有 chat_id 就能发；open_id 是历史字段，HTTP 上报路径不带。"""
         sent = []
         for node in self.list_all():
-            if not node.open_id or not node.chat_id:
+            if not node.chat_id:
                 continue
             try:
                 await self.send_ctrl(node, action, **kwargs)
