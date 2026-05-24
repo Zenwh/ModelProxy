@@ -83,16 +83,10 @@ class APIKeyManager:
     # ---- CRUD ----------------------------------------------------------------
 
     def validate(self, key: str) -> Optional[KeyInfo]:
-        """验证 key（完整 key 或 prefix）。返回 KeyInfo 或 None（无效/被禁用）。"""
+        """验证 key（仅完整 key）。返回 KeyInfo 或 None（无效/被禁用）。"""
         info = self._keys.get(key)
         if info and info.enabled:
             return info
-        # prefix match — only used by admin routes where caller holds the real key
-        resolved = self._resolve_key(key)
-        if resolved:
-            info = self._keys.get(resolved)
-            if info and info.enabled:
-                return info
         return None
 
     def create_key(self, name: str, is_admin: bool = False) -> KeyInfo:

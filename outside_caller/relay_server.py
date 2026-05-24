@@ -308,6 +308,7 @@ async def _verify_agent(request: Request) -> None:
        Fastest, no body read needed; good for internal/trusted tunnels.
     2. Agent sends HMAC-SHA256 of body: hex digest must be
        hmac.compare_digest(sent, hmac.new(AGENT_SECRET, body, sha256).hexdigest()).
+       Body must contain a fresh "timestamp" (Unix seconds, ±60s) to prevent replay.
     """
     provided = request.headers.get(_AGENT_HMAC_HEADER, "")
     if not provided:
@@ -323,7 +324,16 @@ async def _verify_agent(request: Request) -> None:
         config.AGENT_SECRET.encode("utf-8"), body, hashlib.sha256,
     ).hexdigest()
     if hmac.compare_digest(provided, expected):
-        return
+        # Replay protection: require a fresh timestamp in body
+        try:
+            payload = json.loads(body)
+            ts = int(payload.get("timestamp", 0))
+            now = int(time.time())
+            if abs(now - ts) <= 60:
+                return
+        except Exception:
+            pass
+        raise HTTPException(status_code=403, detail="request expired or missing timestamp")
 
     raise HTTPException(status_code=403, detail="invalid X-Agent-Secret")
 
