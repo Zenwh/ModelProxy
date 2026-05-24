@@ -1,9 +1,11 @@
 """
 relay_codec — 飞书消息通道编解码。
 
-飞书 text 消息限制 150KB（HTTP 请求体），扣除信封约 130KB 可用。
-小消息直接发 JSON；大消息 zlib 压缩 + base64 编码，前缀 __zb64__ 标识。
-解码端自动兼容两种格式。
+NOTE: this module is a verbatim copy of the same implementation in the
+``feishu-relay-bot`` repository.  Both repos are maintained in parallel so
+any change here MUST be mirrored there, and vice-versa.  This should
+eventually be extracted into a shared PyPI package, but for now keep both
+copies in sync manually.
 """
 from __future__ import annotations
 

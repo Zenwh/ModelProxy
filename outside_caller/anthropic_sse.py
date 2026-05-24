@@ -32,8 +32,8 @@ def _split_text(text: str, chunk_chars: int = 12) -> List[str]:
 
 async def anthropic_sse_stream(
     raw: Dict[str, Any],
-    chunk_chars: int = 12,
-    chunk_delay: float = 0.02,
+    chunk_chars: int = 64,
+    chunk_delay: float = 0.005,
 ) -> AsyncIterator[str]:
     """
     把 raw_anthropic 响应（来自 MP /v1/messages）转成 Anthropic SSE 事件流。

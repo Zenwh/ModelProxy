@@ -28,6 +28,29 @@ from .relay_codec import PayloadTooLargeError, decode as codec_decode, encode as
 
 logger = logging.getLogger("bot-pool")
 
+# Module-level shared AsyncClient — httpx clients are safe for concurrent
+# use within a single event loop and avoid TCP handshake churn per request.
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(timeout=15)
+    return _http_client
+
+
+async def close_http_client() -> None:
+    """Best-effort close on process shutdown."""
+    global _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        try:
+            await _http_client.aclose()
+        except Exception:
+            pass
+        finally:
+            _http_client = None
+
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -95,11 +118,9 @@ class BotPool:
 
     def _save(self):
         os.makedirs(os.path.dirname(self._file), exist_ok=True)
-        with open(self._file, "w") as f:
-            json.dump(
-                {"nodes": {k: asdict(v) for k, v in self._nodes.items()}},
-                f, indent=2, ensure_ascii=False,
-            )
+        config.atomic_write_json(self._file, {
+            "nodes": {k: asdict(v) for k, v in self._nodes.items()},
+        })
 
     def _ensure_legacy_bot(self):
         """兼容旧配置：BOT_OPEN_ID + CHAT_ID 存在时注册为 legacy 节点。"""
@@ -226,17 +247,17 @@ class BotPool:
             text = codec_encode(payload, allow_compress=can_compress)
         else:
             text = payload
-        async with httpx.AsyncClient(timeout=15) as cli:
-            r = await cli.post(
-                f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
-                params={"receive_id_type": "chat_id"},
-                headers=token_mgr.auth_header(),
-                json={
-                    "receive_id": node.chat_id,
-                    "msg_type": "text",
-                    "content": json.dumps({"text": text}, ensure_ascii=False),
-                },
-            )
+        cli = get_http_client()
+        r = await cli.post(
+            f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
+            params={"receive_id_type": "chat_id"},
+            headers=token_mgr.auth_header(),
+            json={
+                "receive_id": node.chat_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": text}, ensure_ascii=False),
+            },
+        )
         d = r.json()
         if d.get("code") != 0:
             raise RuntimeError(f"发消息失败: code={d.get('code')} msg={d.get('msg')}")
@@ -249,24 +270,28 @@ class BotPool:
         after_ms: int,
         timeout_s: Optional[int] = None,
     ) -> Optional[dict]:
-        """轮询指定 bot 会话，按 req_id 匹配响应。"""
+        """轮询指定 bot 会话，按 req_id 匹配响应。
+
+        为防并发高时消息被挤到第二页，page_size 加大到 50。
+        成功消费后后台删除该消息，避免聊天窗口永久堆积。
+        """
         timeout_s = timeout_s or config.POLL_TIMEOUT_S
         deadline = time.time() + timeout_s
         interval = config.POLL_INTERVAL_S
         seen: set = set()
 
         while time.time() < deadline:
-            async with httpx.AsyncClient(timeout=15) as cli:
-                r = await cli.get(
-                    f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
-                    params={
-                        "container_id_type": "chat",
-                        "container_id": node.chat_id,
-                        "sort_type": "ByCreateTimeDesc",
-                        "page_size": 10,
-                    },
-                    headers=token_mgr.auth_header(),
-                )
+            cli = get_http_client()
+            r = await cli.get(
+                f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
+                params={
+                    "container_id_type": "chat",
+                    "container_id": node.chat_id,
+                    "sort_type": "ByCreateTimeDesc",
+                    "page_size": 50,
+                },
+                headers=token_mgr.auth_header(),
+            )
             d = r.json()
             if d.get("code") != 0:
                 logger.warning("poll err: code=%s msg=%s", d.get("code"), d.get("msg"))
@@ -301,6 +326,8 @@ class BotPool:
                     continue
 
                 if parsed.get("req_id") == req_id:
+                    # 后台删除已消费消息，防止堆积拖慢后续轮询
+                    asyncio.create_task(_try_delete_message(mid))
                     return parsed
 
             await asyncio.sleep(interval)
@@ -361,17 +388,17 @@ class BotPool:
 
     async def _poll_node_heartbeat(self, node: BotNode):
         """扫描单个节点的 chat，解析心跳消息。"""
-        async with httpx.AsyncClient(timeout=15) as cli:
-            r = await cli.get(
-                f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
-                params={
-                    "container_id_type": "chat",
-                    "container_id": node.chat_id,
-                    "sort_type": "ByCreateTimeDesc",
-                    "page_size": 5,
-                },
-                headers=token_mgr.auth_header(),
-            )
+        cli = get_http_client()
+        r = await cli.get(
+            f"{config.FEISHU_BASE}/open-apis/im/v1/messages",
+            params={
+                "container_id_type": "chat",
+                "container_id": node.chat_id,
+                "sort_type": "ByCreateTimeDesc",
+                "page_size": 5,
+            },
+            headers=token_mgr.auth_header(),
+        )
         d = r.json()
         if d.get("code") != 0:
             return
@@ -390,6 +417,39 @@ class BotPool:
             if parsed.get("_relay_v") == 2 and parsed.get("type") == "heartbeat":
                 self.register(parsed)
                 break  # 只取最近一条心跳即可
+
+
+async def _get_tenant_token() -> str:
+    """获取 tenant_access_token（用于删除 bot 自己发的消息）。"""
+    cli = get_http_client()
+    r = await cli.post(
+        f"{config.FEISHU_BASE}/open-apis/auth/v3/tenant_access_token/internal",
+        json={"app_id": config.APP_ID, "app_secret": config.APP_SECRET},
+        timeout=15,
+    )
+    d = r.json()
+    if d.get("code") != 0:
+        raise RuntimeError(f"tenant_token: {d}")
+    return d["tenant_access_token"]
+
+
+async def _try_delete_message(message_id: str) -> None:
+    """Best-effort 删除已消费的 bot 响应消息，防止聊天窗口堆积。"""
+    try:
+        token = await _get_tenant_token()
+        cli = get_http_client()
+        r = await cli.delete(
+            f"{config.FEISHU_BASE}/open-apis/im/v1/messages/{message_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        if r.status_code == 200:
+            logger.debug("deleted consumed message %s", message_id)
+        else:
+            logger.debug("delete message %s: HTTP %d", message_id, r.status_code)
+    except Exception as e:
+        # 大概率是应用没有 im:message:delete 权限，静默忽略
+        logger.debug("delete message failed: %s", e)
 
 
 def _extract_text(msg: dict) -> str:
