@@ -63,3 +63,46 @@ services:
       - ./relay_bot/dist:/data/packages:ro
     labels:
       com.modelproxy.role: "pypi"
+
+  # 本机 worker v3 — 容器化部署，restart=always + healthcheck 保证稳定
+  #
+  # 启动：docker compose up -d worker-local --build
+  # 日志：docker compose logs -f worker-local
+  # 升级：换 relay_bot/dist 里的 wheel → docker compose up -d --build worker-local
+  #
+  # 配置走 bind mount：relay_bot/config.yaml（不入 git，含 secret）
+  worker-local:
+    build:
+      context: ./relay_bot
+      dockerfile: Dockerfile
+    image: feishu-relay-bot:3.0.0
+    container_name: relay-bot-local
+    restart: always
+
+    # 不开端口；worker 只对外打 WS 出方向，没有入站监听
+    network_mode: bridge
+
+    volumes:
+      - ./relay_bot/config.yaml:/etc/relay-bot/config.yaml:ro
+
+    # 关键：自动重启 + OOM/异常时退出
+    stop_grace_period: 10s
+
+    # 资源上限 — 单 worker 实测稳态 < 80MB；给 256MB 留 3x 余量
+    # 注意：docker compose v2 用顶层字段而非 deploy.resources（后者只 Swarm 生效）
+    mem_limit: 256m
+    mem_reservation: 64m
+    cpus: 1.0
+
+    # 日志驱动 — 按大小滚动，避免磁盘吃满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # 镜像里已经定义了 HEALTHCHECK，这里 docker compose 会自动遵循
+
+    labels:
+      com.modelproxy.role: "worker"
+      com.modelproxy.version: "3.0.0"

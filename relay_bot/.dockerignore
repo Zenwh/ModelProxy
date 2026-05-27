@@ -1,0 +1,21 @@
+# 忽略 build context 里不需要的东西，让 image 更小、build 更快
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.venv
+venv
+.git
+.gitignore
+.idea
+.vscode
+.DS_Store
+tests/
+README.md
+DEPLOY*.md
+install.sh
+relay-bot.service
+build/
+# dist/ 里只要 3.0.0 wheel，旧 wheel/依赖 wheel 都不要进镜像
+dist/*
+!dist/feishu_relay_bot-3.0.0-py3-none-any.whl

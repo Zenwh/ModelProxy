@@ -203,14 +203,26 @@ class BotPool:
         兼容 v2 (legacy HTTP / IM 心跳) 和 v3 (OpenClaw IM envelope) 两种 payload：
         - v2 字段：node_id, version, hostname, ip, open_id, chat_id, load, models, started_at, capabilities
         - v3 额外字段：cluster_id, app_id, slot_id, agent_secret (由 _poll_node_heartbeat 解析后传入)
+
+        优化：仅当节点的 round-robin 资格集（chat_id / enabled / relay_v3 caps）实际
+        发生变化时才置 _rr_dirty=True，避免每次心跳都重置 itertools.cycle 的位置
+        导致路由偏向第一个节点。
         """
         node_id = payload.get("node_id")
         if not node_id:
             raise ValueError("missing node_id")
 
+        def _eligibility(n: "BotNode") -> tuple:
+            return (
+                bool(n.chat_id),
+                bool(n.enabled),
+                "relay_v3" in (n.capabilities or []),
+            )
+
         with self._lock:
             existing = self._nodes.get(node_id)
             if existing:
+                before_elig = _eligibility(existing)
                 existing.version = payload.get("version") or existing.version
                 existing.hostname = payload.get("hostname") or existing.hostname
                 existing.ip = payload.get("ip") or existing.ip
@@ -230,6 +242,9 @@ class BotPool:
                 if payload.get("agent_secret"):
                     existing.agent_secret = payload["agent_secret"]
                 node = existing
+                # 只有 eligibility 变化才 invalidate cycle
+                if _eligibility(existing) != before_elig:
+                    self._rr_dirty = True
             else:
                 node = BotNode(
                     node_id=node_id,
@@ -247,11 +262,11 @@ class BotPool:
                     agent_secret=payload.get("agent_secret", ""),
                 )
                 self._nodes[node_id] = node
+                self._rr_dirty = True
                 logger.info(
                     "新 bot 注册: %s (cluster=%s app_id=%s open_id=%s)",
                     node_id, node.cluster_id, node.app_id or "-", node.open_id,
                 )
-            self._rr_dirty = True
             self._save()
             return node
 

@@ -82,6 +82,46 @@ async def openai_stream_from_worker(
                             },
                         }],
                     }, None)
+
+                # messages_native worker mode：worker 把 anthropic SSE events 原样塞进 delta.events
+                # 这里翻译成 OpenAI delta.content / tool_calls。否则 claude-* 模型走
+                # /v1/chat/completions 流式时 client 收不到任何正文（只有 role+finish）。
+                events = delta.get("events")
+                if events and isinstance(events, list):
+                    for ev in events:
+                        ed = ev.get("data") if isinstance(ev.get("data"), dict) else ev
+                        et = ev.get("event") or ev.get("type") or (ed.get("type") if isinstance(ed, dict) else None)
+                        if et == "content_block_delta":
+                            ev_delta = ed.get("delta") or {}
+                            dtype = ev_delta.get("type")
+                            if dtype == "text_delta":
+                                t = ev_delta.get("text") or ""
+                                if t:
+                                    yield _openai_chunk(req_id, model, {"content": t}, None)
+                            elif dtype == "input_json_delta":
+                                pj = ev_delta.get("partial_json") or ""
+                                if pj:
+                                    yield _openai_chunk(req_id, model, {
+                                        "tool_calls": [{
+                                            "index": 0,
+                                            "function": {"arguments": pj},
+                                        }],
+                                    }, None)
+                        elif et == "content_block_start":
+                            cb = ed.get("content_block") or {}
+                            if cb.get("type") == "tool_use":
+                                yield _openai_chunk(req_id, model, {
+                                    "tool_calls": [{
+                                        "index": 0,
+                                        "id": cb.get("id", ""),
+                                        "type": "function",
+                                        "function": {
+                                            "name": cb.get("name", ""),
+                                            "arguments": "",
+                                        },
+                                    }],
+                                }, None)
+                        # message_delta / message_stop 由下方 resp 分支统一收尾，不在这里 yield finish
             elif ptype == "resp":
                 got_resp = True
                 if not parsed.get("ok", True):
