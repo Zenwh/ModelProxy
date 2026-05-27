@@ -25,8 +25,13 @@ _started_at = datetime.now().isoformat(timespec="seconds")
 
 
 def _build_heartbeat(worker: "Worker") -> dict:
+    inflight = 0
+    try:
+        inflight = worker._assembler.inflight_count
+    except Exception:
+        pass
     return {
-        "_relay_v": 2,
+        "_relay_v": 3,
         "type": "heartbeat",
         "node_id": worker.cfg.node_id,
         "open_id": worker.cfg.open_id,
@@ -40,7 +45,8 @@ def _build_heartbeat(worker: "Worker") -> dict:
             "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6",
             "gpt-5.5", "gpt-5.4", "kimi-k2.6", "glm-5.1",
         ],
-        "capabilities": ["zlib"],
+        "capabilities": ["zlib", "relay_v3", "multipart_in", "stream_out"],
+        "inflight_multipart": inflight,
     }
 
 

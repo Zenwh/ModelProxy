@@ -31,6 +31,13 @@ env/
 .env
 .env.local
 
+# Worker 本机配置（含真实 app_secret / api_key），用 config.example.yaml 替代
+relay_bot/config.yaml
+
+# 构建产物（dist 仅在打包时本地生成，不入库）
+dist/
+build/
+
 # Demo / PRD（暂不入库）
 PRD/
 demo/

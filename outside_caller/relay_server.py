@@ -32,7 +32,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import config
-from .anthropic_sse import anthropic_sse_stream
 from .api_keys import KeyInfo, manager as key_mgr
 from .bot_pool import pool as bot_pool
 from .errors import AnthropicError, OpenAIError, error_handler, validation_error_handler
@@ -40,6 +39,10 @@ from .feishu_token import TokenExpiredError, token_mgr
 from .models import is_supported, list_models, to_mp_name, to_endpoint
 from .rate_limit import RateLimiter
 from .relay_codec import PayloadTooLargeError
+from .slot_pool import slot_pool
+from .stream_router import openai_stream_from_worker, anthropic_stream_from_worker
+from .token_estimator import estimate as estimate_tokens
+from .truncator import truncate as truncate_messages
 from .usage import manager as usage_mgr
 
 logging.basicConfig(
@@ -323,8 +326,30 @@ async def chat_completions(req: ChatRequest, request: Request):
     mp_model = to_mp_name(req.model) or req.model
     endpoint = to_endpoint(req.model) or "chat"
 
+    # v3：超过 MAX_INPUT_TOKENS 时中间截断
+    raw_messages = [m.model_dump() for m in req.messages]
+    est_in = estimate_tokens(raw_messages)
+    if est_in > config.MAX_INPUT_TOKENS:
+        try:
+            truncated, info = truncate_messages(
+                raw_messages,
+                system=None,
+                tools=None,
+                budget=config.MAX_INPUT_TOKENS,
+            )
+        except OpenAIError:
+            usage_mgr.record_failed(key_info.name, req.model)
+            _log_access(key_info.name, req.model, 413, time.time() - t0, last_user)
+            raise
+        logger.info(
+            "[%s] req_id=%s truncated: kept=%d dropped=%d est_in=%d → %d",
+            key_info.name, req_id, info["kept_count"], info["dropped_count"],
+            est_in, info["estimated_tokens"],
+        )
+        raw_messages = truncated
+
     logger.info("→ [%s] [%s] req_id=%s msgs=%d stream=%s last=%s",
-                key_info.name, req.model, req_id, len(req.messages),
+                key_info.name, req.model, req_id, len(raw_messages),
                 req.stream, last_user[:60])
 
     before_ms = int(time.time() * 1000)
@@ -337,38 +362,32 @@ async def chat_completions(req: ChatRequest, request: Request):
         raise OpenAIError("api_error", "No available bot nodes", status=503)
     bot_pool.record_request(node)
 
-    # 根据节点版本构造 payload（v1 兼容旧 bot，v2 给新 bot）
-    if node.version:
-        payload = {
-            "_relay_v": 2,
-            "type": "req",
-            "req_id": req_id,
-            "model": mp_model,
-            "endpoint": endpoint,
-            "messages": [m.model_dump() for m in req.messages],
-        }
-    else:
-        payload = {
-            "_relay_v": 1,
-            "req_id": req_id,
-            "model": mp_model,
-            "messages": [m.model_dump() for m in req.messages],
-        }
+    # v3 envelope
+    payload: Dict[str, Any] = {
+        "_relay_v": 3,
+        "type": "req",
+        "req_id": req_id,
+        "model": mp_model,
+        "endpoint": endpoint,
+        "mode": None,
+        "stream": bool(req.stream),
+        "messages": raw_messages,
+    }
     if req.temperature is not None:
         payload["temperature"] = req.temperature
     if req.max_tokens is not None:
         payload["max_tokens"] = req.max_tokens
 
-    # 发 JSON 消息到 bot
+    # v3 上行：拆包发送 req_part
     try:
-        await bot_pool.send_to_bot(node, payload)
+        await bot_pool.send_request(node, payload)
     except PayloadTooLargeError as e:
+        # 单 part 仍超限 → 切片大小有问题，理论不该发生
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 413, time.time() - t0, last_user)
         raise OpenAIError(
             "invalid_request_error",
-            f"Request payload ({e.size_kb:.0f}KB) exceeds relay tunnel limit. "
-            f"Reduce conversation history or system prompt.",
+            f"Multipart envelope still oversized ({e.size_kb:.0f}KB).",
             status=413, param="messages",
         )
     except TokenExpiredError as e:
@@ -380,7 +399,24 @@ async def chat_completions(req: ChatRequest, request: Request):
         _log_access(key_info.name, req.model, 502, time.time() - t0, last_user)
         raise OpenAIError("api_error", str(e), status=502)
 
-    # 按 req_id 轮询 bot 响应
+    # 流式：实时 SSE（gateway 边轮询边推）
+    if req.stream:
+        return StreamingResponse(
+            openai_stream_from_worker(
+                node=node,
+                req_id=req_id,
+                model=req.model,
+                after_ms=before_ms,
+                key_name=key_info.name,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # 非流式：轮询直到 v3 resp
     reply = await bot_pool.poll_reply_by_req_id(node, req_id, after_ms=before_ms)
     if reply is None:
         usage_mgr.record_failed(key_info.name, req.model)
@@ -438,17 +474,6 @@ async def chat_completions(req: ChatRequest, request: Request):
                 content[:60])
     _log_access(key_info.name, req.model, 200, duration, last_user)
 
-    # ----- 流式分支（伪流式） -----
-    if req.stream:
-        return StreamingResponse(
-            _sse_stream(req_id, req.model, content, finish_reason),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",      # nginx 关 buffering
-            },
-        )
-
     # ----- 普通响应 -----
     return ChatResponse(
         id=f"chatcmpl-{req_id}",
@@ -462,7 +487,7 @@ async def chat_completions(req: ChatRequest, request: Request):
     )
 
 
-# ----- SSE chunk emit -----
+# ----- SSE chunk emit (helpers shared with stream_router) -----
 
 def _sse_chunk(req_id: str, model: str, delta: dict, finish_reason: Optional[str]) -> str:
     """构造一条 OpenAI 格式的 SSE chunk。"""
@@ -478,30 +503,6 @@ def _sse_chunk(req_id: str, model: str, delta: dict, finish_reason: Optional[str
         }],
     }
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
-
-
-def _split_for_stream(text: str, chunk_chars: int = 12) -> list:
-    """把完整文本切成小块用于"伪流式"。"""
-    if not text:
-        return [""]
-    return [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
-
-
-async def _sse_stream(req_id: str, model: str, content: str, finish_reason: str):
-    """SSE 生成器：role chunk + N 个 content chunk + finish chunk + [DONE]。"""
-    # 1) role chunk
-    yield _sse_chunk(req_id, model, {"role": "assistant"}, None)
-    await asyncio.sleep(0.01)
-
-    # 2) content chunks
-    chunks = _split_for_stream(content, chunk_chars=12)
-    for piece in chunks:
-        yield _sse_chunk(req_id, model, {"content": piece}, None)
-        await asyncio.sleep(0.02)   # 每块 20ms，模拟流式
-
-    # 3) finish chunk
-    yield _sse_chunk(req_id, model, {}, finish_reason)
-    yield "data: [DONE]\n\n"
 
 
 # ============================================================================
@@ -551,18 +552,46 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
     # 3. 构造 relay 协议
     req_id = uuid.uuid4().hex[:24]
     req_data = req.model_dump(exclude_none=True)
-    req_data.pop("stream", None)
+    # stream 字段透传给 bot；max_tokens 兜底
     if not req_data.get("max_tokens"):
         req_data["max_tokens"] = DEFAULT_MAX_TOKENS
 
+    # v3：超过 MAX_INPUT_TOKENS 时中间截断
+    raw_messages = req_data.get("messages") or []
+    sys_field = req_data.get("system")
+    tools_field = req_data.get("tools") or []
+    est_in = estimate_tokens(raw_messages, system=sys_field, tools=tools_field)
+    if est_in > config.MAX_INPUT_TOKENS:
+        try:
+            truncated, info = truncate_messages(
+                raw_messages,
+                system=sys_field,
+                tools=tools_field,
+                budget=config.MAX_INPUT_TOKENS,
+            )
+        except OpenAIError as e:
+            # 转 Anthropic 错误格式
+            usage_mgr.record_failed(key_info.name, req.model)
+            _log_access(key_info.name, req.model, 413, time.time() - t0, "")
+            raise AnthropicError("invalid_request_error", e.detail, status=413)
+        logger.info(
+            "[%s] req_id=%s truncated: kept=%d dropped=%d est_in=%d → %d",
+            key_info.name, req_id, info["kept_count"], info["dropped_count"],
+            est_in, info["estimated_tokens"],
+        )
+        req_data["messages"] = truncated
+
     payload = {
-        "_relay_v": 2,
+        "_relay_v": 3,
         "type": "req",
         "req_id": req_id,
         "endpoint": "messages",
         "mode": "messages_native",
+        "stream": bool(req.stream),
         **req_data,
     }
+    # model_dump 已经把 stream 写进 req_data，避免重复 key 冲突
+    payload["stream"] = bool(req.stream)
 
     # 截一段 user 文本用日志
     last_user = ""
@@ -593,14 +622,13 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
 
     # 4. 发飞书 + 轮询
     try:
-        await bot_pool.send_to_bot(node, payload)
+        await bot_pool.send_request(node, payload)
     except PayloadTooLargeError as e:
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 413, time.time() - t0, last_user)
         raise AnthropicError(
             "invalid_request_error",
-            f"Request payload ({e.size_kb:.0f}KB) exceeds relay tunnel capacity. "
-            f"Reduce messages or tool definitions.",
+            f"Multipart envelope still oversized ({e.size_kb:.0f}KB).",
             status=413,
         )
     except TokenExpiredError as e:
@@ -611,6 +639,23 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
         usage_mgr.record_failed(key_info.name, req.model)
         _log_access(key_info.name, req.model, 502, time.time() - t0, last_user)
         raise AnthropicError("api_error", str(e), status=502)
+
+    # 流式：实时 SSE
+    if req.stream:
+        return StreamingResponse(
+            anthropic_stream_from_worker(
+                node=node,
+                req_id=req_id,
+                model=req.model,
+                after_ms=before_ms,
+                key_name=key_info.name,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     reply = await bot_pool.poll_reply_by_req_id(node, req_id, after_ms=before_ms)
     if reply is None:
@@ -656,18 +701,7 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
                 in_tok, out_tok, raw.get("stop_reason"))
     _log_access(key_info.name, req.model, 200, duration, last_user)
 
-    # 6. 响应：流式 or 非流式
-    if req.stream:
-        return StreamingResponse(
-            anthropic_sse_stream(raw),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    # 非流式直接返回 raw（即 MP 的原 Anthropic 响应）
+    # 非流式：直接返回 raw（即 MP 的原 Anthropic 响应）
     return raw
 
 
@@ -935,6 +969,12 @@ async def admin_list_nodes(request: Request):
                 "total_prompt_tokens": n.total_prompt_tokens,
                 "total_completion_tokens": n.total_completion_tokens,
                 "total_tokens": n.total_tokens,
+                # v0.4 cluster fields（详见 arch-cluster-upgrade.md §3.1）
+                "enabled": n.enabled,
+                "cluster_id": n.cluster_id,
+                "app_id": n.app_id,
+                "slot_id": n.slot_id,
+                # agent_secret 永远不外泄
             }
             for n in nodes
         ],
@@ -965,7 +1005,7 @@ class CtrlRequest(BaseModel):
     target_version: Optional[str] = None
 
 
-@app.post("/admin/nodes/{node_id}/upgrade")
+@app.post("/admin/nodes/{node_id:path}/upgrade")
 async def admin_upgrade_node(node_id: str, req: CtrlRequest, request: Request):
     """给指定 bot 发升级指令。"""
     _check_admin(request)
@@ -976,7 +1016,7 @@ async def admin_upgrade_node(node_id: str, req: CtrlRequest, request: Request):
     return {"status": "sent", "node_id": node_id, "action": "upgrade"}
 
 
-@app.post("/admin/nodes/{node_id}/restart")
+@app.post("/admin/nodes/{node_id:path}/restart")
 async def admin_restart_node(node_id: str, request: Request):
     """给指定 bot 发重启指令。"""
     _check_admin(request)
@@ -987,7 +1027,7 @@ async def admin_restart_node(node_id: str, request: Request):
     return {"status": "sent", "node_id": node_id, "action": "restart"}
 
 
-@app.post("/admin/nodes/{node_id}/drain")
+@app.post("/admin/nodes/{node_id:path}/drain")
 async def admin_drain_node(node_id: str, request: Request):
     """给指定 bot 发优雅下线指令。"""
     _check_admin(request)
@@ -996,6 +1036,274 @@ async def admin_drain_node(node_id: str, request: Request):
         raise OpenAIError("not_found_error", f"Node {node_id} not found", status=404)
     await bot_pool.send_ctrl(node, "drain")
     return {"status": "sent", "node_id": node_id, "action": "drain"}
+
+
+# ---- v0.4 cluster upgrade: enable / disable / decommission ----
+# 详见 arch-cluster-upgrade.md §3.1 (admin 软开关) 和 §3.5 (节点生命周期)
+
+
+@app.post("/admin/nodes/{node_id:path}/enable")
+async def admin_enable_node(node_id: str, request: Request):
+    """启用节点：放回 round-robin 路由池。"""
+    _check_admin(request)
+    if not bot_pool.set_enabled(node_id, True):
+        raise OpenAIError("not_found_error", f"Node {node_id} not found", status=404)
+    return {"status": "ok", "node_id": node_id, "enabled": True}
+
+
+@app.post("/admin/nodes/{node_id:path}/disable")
+async def admin_disable_node(node_id: str, request: Request):
+    """禁用节点：从 round-robin 移除但保留记录（不释放 slot）。"""
+    _check_admin(request)
+    if not bot_pool.set_enabled(node_id, False):
+        raise OpenAIError("not_found_error", f"Node {node_id} not found", status=404)
+    return {"status": "ok", "node_id": node_id, "enabled": False}
+
+
+@app.post("/admin/nodes/{node_id:path}/decommission")
+async def admin_decommission_node(node_id: str, request: Request):
+    """彻底下线节点：从 pool 移除 + 释放绑定的 slot（如有）。
+
+    SlotPool 集成在后续 M2-3 完成后接入；当前只做 bot_pool.remove()。
+    """
+    _check_admin(request)
+    node = bot_pool.get(node_id)
+    if not node:
+        raise OpenAIError("not_found_error", f"Node {node_id} not found", status=404)
+    slot_id = node.slot_id
+    bot_pool.remove(node_id)
+    if slot_id:
+        slot_pool.release(slot_id)
+    return {
+        "status": "ok",
+        "node_id": node_id,
+        "action": "decommission",
+        "released_slot_id": slot_id or None,
+    }
+
+
+# ---- v0.4 cluster upgrade: SlotPool 管理 API ----
+# 详见 arch-cluster-upgrade.md §3.2
+
+
+class CreateSlotRequest(BaseModel):
+    app_id: str
+    app_secret: str
+    chat_id: str
+    mp_key: str
+    mp_base_url: str = ""
+    notes: str = ""
+    capabilities: Optional[List[str]] = None
+    default_max_tokens: int = 4096
+    heartbeat_interval_s: int = 30
+    slot_id: Optional[str] = None  # 不指定则自动编号
+
+
+def _slot_to_dict(s, include_secrets: bool = False) -> dict:
+    """slot dump 为 dict。admin 查看时默认隐藏 app_secret / mp_key，
+    防止运维误把列表贴到聊天工具被泄露。
+    """
+    d = {
+        "slot_id": s.slot_id,
+        "app_id": s.app_id,
+        "chat_id": s.chat_id,
+        "mp_base_url": s.mp_base_url,
+        "notes": s.notes,
+        "capabilities": s.capabilities,
+        "default_max_tokens": s.default_max_tokens,
+        "heartbeat_interval_s": s.heartbeat_interval_s,
+        "claimed_by": s.claimed_by,
+        "claimed_at": s.claimed_at,
+        "created_at": s.created_at,
+        "is_free": s.is_free,
+    }
+    if include_secrets:
+        d["app_secret"] = s.app_secret
+        d["mp_key"] = s.mp_key
+    else:
+        d["app_secret_preview"] = (s.app_secret[:4] + "***" + s.app_secret[-2:]) if s.app_secret else ""
+        d["mp_key_preview"] = (s.mp_key[:4] + "***" + s.mp_key[-2:]) if s.mp_key else ""
+    return d
+
+
+@app.get("/admin/pool/slots")
+async def admin_list_slots(request: Request):
+    """列出所有 slot 及 claim 状态。默认隐藏 secret，传 ?reveal=1 查全量。"""
+    _check_admin(request)
+    reveal = request.query_params.get("reveal") == "1"
+    slots = slot_pool.list_slots()
+    return {
+        "total": len(slots),
+        "free_count": slot_pool.free_count,
+        "claimed_count": slot_pool.claimed_count,
+        "slots": [_slot_to_dict(s, include_secrets=reveal) for s in slots],
+    }
+
+
+@app.post("/admin/pool/slots")
+async def admin_create_slot(req: CreateSlotRequest, request: Request):
+    """灌一条新 slot 进池子。"""
+    _check_admin(request)
+    try:
+        slot = slot_pool.add(
+            app_id=req.app_id,
+            app_secret=req.app_secret,
+            chat_id=req.chat_id,
+            mp_key=req.mp_key,
+            mp_base_url=req.mp_base_url,
+            notes=req.notes,
+            capabilities=req.capabilities,
+            default_max_tokens=req.default_max_tokens,
+            heartbeat_interval_s=req.heartbeat_interval_s,
+            slot_id=req.slot_id,
+        )
+    except ValueError as e:
+        raise OpenAIError("invalid_request_error", str(e), status=400)
+    return {"status": "ok", "slot": _slot_to_dict(slot, include_secrets=False)}
+
+
+@app.delete("/admin/pool/slots/{slot_id}")
+async def admin_delete_slot(slot_id: str, request: Request):
+    """删除一条 slot（必须先 release）。"""
+    _check_admin(request)
+    try:
+        ok = slot_pool.delete(slot_id)
+    except ValueError as e:
+        # claimed slot 不让删
+        raise OpenAIError("invalid_request_error", str(e), status=409)
+    if not ok:
+        raise OpenAIError("not_found_error", f"Slot {slot_id} not found", status=404)
+    return {"status": "ok", "slot_id": slot_id, "action": "deleted"}
+
+
+@app.post("/admin/pool/slots/{slot_id}/release")
+async def admin_release_slot(slot_id: str, request: Request):
+    """强制 release 一个 slot（紧急用：节点失联但 slot 仍被持有）。
+
+    注意：这只是让 slot 回到空闲池，bot_pool 里那个节点不会自动消失；
+    要彻底下线请用 /admin/nodes/{node_id}/decommission。
+    """
+    _check_admin(request)
+    ok = slot_pool.release(slot_id)
+    if not ok:
+        raise OpenAIError("not_found_error", f"Slot {slot_id} not found", status=404)
+    return {"status": "ok", "slot_id": slot_id, "action": "released"}
+
+
+# ---- v0.4 cluster upgrade: /bootstrap (install-time only) ----
+# 详见 arch-cluster-upgrade.md §3.3
+#
+# 路径设计：nginx 上 `/llm/api/bootstrap` 剥去前缀后落到 `/bootstrap`。
+# 这是节点全生命周期里**与 gateway 域名的唯一一次 HTTP 交互**——install 时
+# 拿配置，之后切到 Feishu IM transport，不再访问 gateway 域名。
+
+
+class BootstrapClawIdentity(BaseModel):
+    id: str
+    type: str = "InferenceClaw"
+    version: str = ""
+
+
+class BootstrapRequest(BaseModel):
+    claw: BootstrapClawIdentity
+    cluster: str = ""
+    hostname: str = ""
+    ip: str = ""
+
+
+def _build_bootstrap_response(claw_secret: str, slot, heartbeat_interval_s: int) -> dict:
+    """构造 bootstrap 返回体（节点拿到后写入 config.yaml + config.yaml.secret）。"""
+    return {
+        "claw_secret": claw_secret,
+        "slot_id": slot.slot_id,
+        "app_id": slot.app_id,
+        "app_secret": slot.app_secret,
+        "chat_id": slot.chat_id,
+        "mp_key": slot.mp_key,
+        "mp_base_url": slot.mp_base_url or config.MODELPROXY_BASE,
+        "capabilities": list(slot.capabilities or list_models()),
+        "default_max_tokens": slot.default_max_tokens or 4096,
+        "heartbeat_interval_s": heartbeat_interval_s,
+    }
+
+
+@app.post("/bootstrap")
+async def bootstrap_endpoint(req: BootstrapRequest, request: Request):
+    """节点装机时调用：用 BOOTSTRAP_TOKEN 换一份 slot 配置 + 长效 claw_secret。
+
+    幂等性：同 claw_id 重复调用返回已绑定的 slot 配置（不重新 claim）。
+    错误码：
+    - 401  bad_bootstrap_token
+    - 503  no_free_slot  池子无空闲
+    - 500  internal error
+    """
+    if not config.BOOTSTRAP_TOKEN:
+        # 端点存在但未启用：返回 503 而不是 404，避免泄露功能存在与否
+        raise HTTPException(503, "bootstrap not enabled")
+
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != config.BOOTSTRAP_TOKEN:
+        raise HTTPException(401, "invalid bootstrap token")
+
+    node_id = req.claw.id
+    if not node_id:
+        raise HTTPException(400, "claw.id required")
+
+    # 幂等：该 node_id 已注册并绑定了 slot → 直接返回
+    existing = bot_pool.get(node_id)
+    if existing and existing.slot_id and existing.agent_secret:
+        slot = slot_pool.get(existing.slot_id)
+        if slot:
+            logger.info(
+                "[bootstrap] idempotent re-bootstrap: node=%s slot=%s",
+                node_id, slot.slot_id,
+            )
+            return _build_bootstrap_response(
+                existing.agent_secret, slot, config.CLUSTER_HEARTBEAT_INTERVAL_S,
+            )
+        # slot 居然丢了（人工 release 但 bot_pool 没清）→ 把节点也清掉，按新节点处理
+        logger.warning(
+            "[bootstrap] node=%s has slot_id=%s but slot missing; re-claiming",
+            node_id, existing.slot_id,
+        )
+        bot_pool.remove(node_id)
+
+    # claim 一个空闲 slot
+    slot = slot_pool.claim(node_id)
+    if not slot:
+        logger.warning(
+            "[bootstrap] no_free_slot: node=%s cluster=%s",
+            node_id, req.cluster,
+        )
+        raise HTTPException(503, "no_free_slot")
+
+    # 生成长效 claw_secret 并注册节点
+    import secrets as _secrets
+    claw_secret = _secrets.token_hex(24)  # 48-char hex
+    try:
+        bot_pool.register({
+            "node_id": node_id,
+            "cluster_id": req.cluster or "default",
+            "hostname": req.hostname,
+            "ip": req.ip,
+            "app_id": slot.app_id,
+            "chat_id": slot.chat_id,
+            "slot_id": slot.slot_id,
+            "agent_secret": claw_secret,
+            "version": req.claw.version,
+        })
+    except Exception:
+        # 注册失败要回滚 slot，避免泄漏
+        slot_pool.release(slot.slot_id)
+        raise
+
+    logger.info(
+        "[bootstrap] new node registered: node=%s cluster=%s slot=%s app_id=%s",
+        node_id, req.cluster, slot.slot_id, slot.app_id,
+    )
+    return _build_bootstrap_response(
+        claw_secret, slot, config.CLUSTER_HEARTBEAT_INTERVAL_S,
+    )
 
 
 @app.post("/admin/nodes/upgrade-all")

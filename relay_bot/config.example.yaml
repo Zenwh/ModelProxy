@@ -1,11 +1,24 @@
-# 示例配置
+# Worker v3 部署示例配置；复制为 config.yaml 后填实
 feishu:
-  app_id: cli_xxx
-  app_secret: your_app_secret_here
+  app_id: cli_xxxxxxxxxxxxxxxx
+  app_secret: PLACEHOLDER_REPLACE_ME
 
 mp:
-  url: http://mp.internal:8000
+  url: https://models-proxy.example.com
+  api_key: ak-xxxxxxxxxxxxxxxxxxxxxxxx
 
-# 可选
-node_id: ""                  # 空则自动用 hostname
+# Gateway↔Worker 共用的飞书会话（从 gateway 注册时分配）
+chat_id: oc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 节点身份（同一 chat 内多 worker 必须 node_id 唯一）
+node_id: bot-node-01
 heartbeat_interval_s: 30
+
+# v3 流式参数（保守值，多 worker 上线初期）
+stream:
+  flush_bytes: 1024     # 累计文本 ≥ 1KB 触发 flush
+  flush_ms: 1000        # 距上次 flush ≥ 1s 触发 flush
+  send_qps: 4.0         # 本地令牌桶限速；飞书单 chat 推荐 ≤ 4 msg/s
+
+# 多片重组超时（gateway 端要在该窗口内把所有 req_part 送达）
+multipart_timeout_s: 180
