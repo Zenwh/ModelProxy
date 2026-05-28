@@ -4,8 +4,10 @@
 import os
 
 # 飞书 app（cli_a955f5aa04f81bda）
+# APP_SECRET 必须通过环境变量注入。生产 systemd unit 用 EnvironmentFile 配置，
+# 不再保留硬编码 fallback（旧 fallback "WgVfCkJ..." 已废弃，请使用环境变量）。
 APP_ID = os.getenv("FEISHU_APP_ID", "cli_a955f5aa04f81bda")
-APP_SECRET = os.getenv("FEISHU_APP_SECRET", "WgVfCkJcdggcJqkoJDVKB6YkL2JqoT16")
+APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
 
 # OAuth
 REDIRECT_HOST = os.getenv("OAUTH_REDIRECT_HOST", "localhost")

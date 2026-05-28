@@ -79,7 +79,18 @@ def _auth_header_for(node: "BotNode") -> dict:
     现在强制优先 user_access_token (token_mgr) — sender_type=user，bot 端正常触发事件。
     仅在 token_mgr 无 token 且节点有 app_id 时退回 tenant token（不可工作但保持向后兼容）。
     多 slot / 多 user OAuth 场景待 v0.5 重新设计 token 路由。
+
+    20260528 xpage 多 app 补丁:
+    当 bot 节点持有自己独立的 app_id（与 gateway 的 APP_ID 不同），用该 app 的 tenant
+    token 发送 — 因为 sender app_id != bot app_id，不会触发反回环抑制，bot 能正常收到事件。
+    这是 v3 多 worker bot 共存（per-bot 独立 app_id）的必备路由。
     """
+    # xpage fix: 节点有自己的 app_id 时优先用该 app 的 tenant token
+    if node.app_id and node.app_id != config.APP_ID:
+        try:
+            return token_pool.auth_header(node.app_id)
+        except Exception:
+            pass
     # 优先 user OAuth
     if getattr(token_mgr, "_token", None):
         return token_mgr.auth_header()
