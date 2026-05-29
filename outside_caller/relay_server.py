@@ -29,11 +29,12 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import config
+from .anthropic_compat import is_claude_model, prepare_anthropic_request
 from .api_keys import KeyInfo, manager as key_mgr
 from .bot_pool import close_http_client, pool as bot_pool
 from .errors import AnthropicError, OpenAIError, error_handler, validation_error_handler
@@ -42,7 +43,11 @@ from .models import is_supported, list_models, to_endpoint
 from .rate_limit import RateLimiter
 from .relay_codec import PayloadTooLargeError
 from .slot_pool import slot_pool
-from .stream_router import openai_stream_from_worker, anthropic_stream_from_worker
+from .stream_router import (
+    openai_stream_from_worker,
+    anthropic_stream_from_worker,
+    responses_stream_from_worker,
+)
 from .token_estimator import estimate as estimate_tokens
 from .truncator import truncate as truncate_messages
 from .usage import manager as usage_mgr
@@ -162,7 +167,7 @@ async def _lifespan(app: FastAPI):
 app = FastAPI(
     title="Feishu Relay — OpenAI-compatible API",
     description="通过飞书 Bot 隧道访问内网 Agent",
-    version="0.2.0",
+    version="3.0.1",
     lifespan=_lifespan,
 )
 
@@ -189,11 +194,15 @@ if _DASHBOARD_DIR.exists():
 
 
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     role: str
-    content: Any  # str | List[dict] for vision/image_url support
+    content: Any = None  # str | List[dict] for vision/image_url support
 
 
 class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: str = "feishu/default"
     messages: List[ChatMessage]
     stream: bool = False
@@ -204,6 +213,8 @@ class ChatRequest(BaseModel):
 class ChoiceMessage(BaseModel):
     role: str = "assistant"
     content: str
+    reasoning_content: Optional[str] = None
+    reasoning: Optional[str] = None
 
 
 class Choice(BaseModel):
@@ -245,6 +256,125 @@ class AnthropicTool(BaseModel):
 
 
 DEFAULT_MAX_TOKENS = 4096   # /v1/messages 客户端没传时的默认上限
+
+ANTHROPIC_PASSTHROUGH_HEADERS = (
+    "anthropic-version",
+    "anthropic-beta",
+    "anthropic-dangerous-direct-browser-access",
+)
+
+
+def _anthropic_headers_from_request(request: Request) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    for name in ANTHROPIC_PASSTHROUGH_HEADERS:
+        value = request.headers.get(name)
+        if value:
+            headers[name] = value
+    return headers
+
+
+def _apply_deepseek_chat_template_kwargs(payload: Dict[str, Any]) -> None:
+    model = str(payload.get("model") or "")
+    if model in ("deepseek-v3.2-think-ks", "ccr/deepseek-v3.2-think-ks"):
+        payload["chat_template_kwargs"] = {"thinking": True}
+    elif model in ("deepseek-v3.2-ks", "ccr/deepseek-v3.2-ks"):
+        payload["chat_template_kwargs"] = {"thinking": False}
+
+
+def _force_chat_stream_usage(payload: Dict[str, Any]) -> None:
+    if not payload.get("stream"):
+        return
+    stream_options = payload.get("stream_options")
+    if not isinstance(stream_options, dict):
+        stream_options = {}
+    stream_options["include_usage"] = True
+    payload["stream_options"] = stream_options
+
+
+def _extract_response_input_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict):
+                if item.get("type") in ("message", "input_text", "output_text"):
+                    parts.append(_extract_response_input_text(item.get("content") or item.get("text") or ""))
+                elif "content" in item:
+                    parts.append(_extract_response_input_text(item.get("content")))
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(p for p in parts if p)
+    return str(value) if value is not None else ""
+
+
+def _extract_responses_output_text(raw_response: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    for item in raw_response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content in item.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "output_text":
+                parts.append(content.get("text", "") or "")
+    return "".join(parts)
+
+
+def _normalize_responses_usage(usage: Dict[str, Any]) -> Dict[str, int]:
+    in_tok = int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0)
+    out_tok = int(usage.get("output_tokens") or usage.get("completion_tokens") or 0)
+    total = int(usage.get("total_tokens") or in_tok + out_tok)
+    return {
+        "prompt_tokens": in_tok,
+        "completion_tokens": out_tok,
+        "total_tokens": total,
+    }
+
+
+def _legacy_responses_object(
+    *,
+    req_id: str,
+    model: str,
+    content: str,
+    usage: Dict[str, Any],
+) -> Dict[str, Any]:
+    normalized_usage = _normalize_responses_usage(usage)
+    return {
+        "id": f"resp_{req_id}",
+        "object": "response",
+        "created_at": int(time.time()),
+        "model": model,
+        "status": "completed",
+        "output": [{
+            "id": f"msg_{req_id}",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": content,
+                "annotations": [],
+            }],
+        }],
+        "usage": {
+            "input_tokens": normalized_usage["prompt_tokens"],
+            "output_tokens": normalized_usage["completion_tokens"],
+            "total_tokens": normalized_usage["total_tokens"],
+        },
+    }
+
+
+async def _read_json_object(request: Request, *, anthropic: bool = False) -> Dict[str, Any]:
+    try:
+        data = await request.json()
+    except Exception as e:
+        if anthropic:
+            raise AnthropicError("invalid_request_error", f"Invalid JSON body: {e}", status=400)
+        raise OpenAIError("invalid_request_error", f"Invalid JSON body: {e}", status=400)
+    if not isinstance(data, dict):
+        if anthropic:
+            raise AnthropicError("invalid_request_error", "Request body must be a JSON object", status=400)
+        raise OpenAIError("invalid_request_error", "Request body must be a JSON object", status=400)
+    return data
 
 class MessagesRequest(BaseModel):
     model: str
@@ -351,6 +481,17 @@ async def chat_completions(req: ChatRequest, request: Request):
     key_info = _check_auth(request)
     t0 = time.time()
 
+    if is_claude_model(req.model):
+        raise OpenAIError(
+            "invalid_request_error",
+            "Claude models must use /v1/messages on Feishu relay v3.0.1; "
+            "/v1/chat/completions Claude compatibility is disabled to preserve "
+            "Anthropic native block semantics.",
+            status=400,
+            code="use_messages_endpoint",
+            param="model",
+        )
+
     # 校验模型在白名单
     if not is_supported(req.model):
         raise OpenAIError(
@@ -395,7 +536,8 @@ async def chat_completions(req: ChatRequest, request: Request):
     endpoint = to_endpoint(req.model) or "chat"
 
     # v3：超过 MAX_INPUT_TOKENS 时中间截断
-    raw_messages = [m.model_dump() for m in req.messages]
+    req_data = req.model_dump(exclude_none=True)
+    raw_messages = req_data.get("messages") or [m.model_dump() for m in req.messages]
     est_in = estimate_tokens(raw_messages)
     if est_in > config.MAX_INPUT_TOKENS:
         try:
@@ -415,6 +557,7 @@ async def chat_completions(req: ChatRequest, request: Request):
             est_in, info["estimated_tokens"],
         )
         raw_messages = truncated
+    req_data["messages"] = raw_messages
 
     logger.info("→ [%s] [%s] req_id=%s msgs=%d stream=%s last=%s",
                 key_info.name, req.model, req_id, len(raw_messages),
@@ -435,16 +578,14 @@ async def chat_completions(req: ChatRequest, request: Request):
         "_relay_v": 3,
         "type": "req",
         "req_id": req_id,
-        "model": req.model,
         "endpoint": endpoint,
         "mode": None,
-        "stream": bool(req.stream),
-        "messages": raw_messages,
+        **req_data,
     }
-    if req.temperature is not None:
-        payload["temperature"] = req.temperature
-    if req.max_tokens is not None:
-        payload["max_tokens"] = req.max_tokens
+    payload["stream"] = bool(req.stream)
+    _apply_deepseek_chat_template_kwargs(payload)
+    if endpoint == "chat":
+        _force_chat_stream_usage(payload)
 
     # v3 上行：拆包发送 req_part
     try:
@@ -510,6 +651,13 @@ async def chat_completions(req: ChatRequest, request: Request):
     content = reply.get("content", "")
     usage_dict = reply.get("usage") or {}
     finish_reason = reply.get("finish_reason", "stop")
+    reasoning_content = reply.get("reasoning_content")
+    reasoning = reply.get("reasoning")
+
+    if endpoint == "responses" and reply.get("raw_response"):
+        raw_response = reply["raw_response"]
+        content = _extract_responses_output_text(raw_response)
+        usage_dict = _normalize_responses_usage(raw_response.get("usage") or usage_dict)
 
     # messages_native 模式：从 raw_anthropic 提取内容
     if reply.get("mode") == "messages_native" and reply.get("raw_anthropic"):
@@ -548,7 +696,11 @@ async def chat_completions(req: ChatRequest, request: Request):
         created=int(time.time()),
         model=req.model,
         choices=[Choice(
-            message=ChoiceMessage(content=content),
+            message=ChoiceMessage(
+                content=content,
+                reasoning_content=reasoning_content,
+                reasoning=reasoning,
+            ),
             finish_reason=finish_reason,
         )],
         usage=Usage(prompt_tokens=p_tok, completion_tokens=c_tok, total_tokens=t_tok),
@@ -582,23 +734,33 @@ def _sse_chunk(req_id: str, model: str, delta: dict, finish_reason: Optional[str
 
 
 @app.post("/v1/messages")
-async def messages_endpoint(req: MessagesRequest, request: Request):
+async def messages_endpoint(request: Request):
     """Anthropic Messages API 入口。仅 Claude 系模型。"""
     key_info = _check_auth(request)
     t0 = time.time()
+    req_data = await _read_json_object(request, anthropic=True)
+    model = str(req_data.get("model") or "")
+    stream = bool(req_data.get("stream", False))
+    raw_messages = req_data.get("messages") or []
 
     # 1. 模型限制：仅 Claude
-    if not req.model.startswith("claude-"):
+    if not is_claude_model(model):
         raise AnthropicError(
             "invalid_request_error",
-            f"/v1/messages only accepts Claude models, got: {req.model}",
+            f"/v1/messages only accepts Claude models, got: {model}",
             status=400,
         )
-    if not is_supported(req.model):
+    if not is_supported(model):
         raise AnthropicError(
             "invalid_request_error",
-            f"Unsupported model: {req.model}. Supported Claude: "
+            f"Unsupported model: {model}. Supported Claude: "
             + ", ".join(m for m in list_models() if m.startswith("claude-")),
+            status=400,
+        )
+    if not isinstance(raw_messages, list) or not raw_messages:
+        raise AnthropicError(
+            "invalid_request_error",
+            "messages must be a non-empty array",
             status=400,
         )
 
@@ -622,9 +784,12 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
 
     # 3. 构造 relay 协议
     req_id = uuid.uuid4().hex[:24]
-    req_data = req.model_dump(exclude_none=True)
+    sanitize_stats = prepare_anthropic_request(req_data)
+    if any(sanitize_stats.values()):
+        logger.info("[%s] req_id=%s anthropic sanitized=%s", key_info.name, req_id, sanitize_stats)
+
     # stream 字段透传给 bot；max_tokens 兜底
-    if not req_data.get("max_tokens"):
+    if req_data.get("max_tokens") is None:
         req_data["max_tokens"] = DEFAULT_MAX_TOKENS
 
     # v3：超过 MAX_INPUT_TOKENS 时中间截断
@@ -642,8 +807,8 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
             )
         except OpenAIError as e:
             # 转 Anthropic 错误格式
-            usage_mgr.record_failed(key_info.name, req.model)
-            _log_access(key_info.name, req.model, 413, time.time() - t0, "")
+            usage_mgr.record_failed(key_info.name, model)
+            _log_access(key_info.name, model, 413, time.time() - t0, "")
             raise AnthropicError("invalid_request_error", e.detail, status=413)
         logger.info(
             "[%s] req_id=%s truncated: kept=%d dropped=%d est_in=%d → %d",
@@ -658,17 +823,20 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
         "req_id": req_id,
         "endpoint": "messages",
         "mode": "messages_native",
-        "stream": bool(req.stream),
+        "stream": stream,
         **req_data,
     }
     # model_dump 已经把 stream 写进 req_data，避免重复 key 冲突
-    payload["stream"] = bool(req.stream)
+    payload["stream"] = stream
+    anthropic_headers = _anthropic_headers_from_request(request)
+    if anthropic_headers:
+        payload["anthropic_headers"] = anthropic_headers
 
     # 截一段 user 文本用日志
     last_user = ""
-    if req.messages:
-        last = req.messages[-1]
-        c = last.content
+    if raw_messages:
+        last = raw_messages[-1]
+        c = last.get("content") if isinstance(last, dict) else None
         if isinstance(c, str):
             last_user = c
         elif isinstance(c, list):
@@ -678,16 +846,16 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
                     break
 
     logger.info("→ [%s] [%s] req_id=%s mode=anthropic msgs=%d stream=%s last=%s",
-                key_info.name, req.model, req_id, len(req.messages),
-                req.stream, last_user[:60])
+                key_info.name, model, req_id, len(raw_messages),
+                stream, last_user[:60])
 
     before_ms = int(time.time() * 1000)
 
     # 选一个 bot
     node = bot_pool.select()
     if not node:
-        usage_mgr.record_failed(key_info.name, req.model)
-        _log_access(key_info.name, req.model, 503, time.time() - t0, last_user)
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 503, time.time() - t0, last_user)
         raise AnthropicError("api_error", "No available bot nodes", status=503)
     bot_pool.record_request(node)
 
@@ -695,29 +863,29 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
     try:
         await bot_pool.send_request(node, payload)
     except PayloadTooLargeError as e:
-        usage_mgr.record_failed(key_info.name, req.model)
-        _log_access(key_info.name, req.model, 413, time.time() - t0, last_user)
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 413, time.time() - t0, last_user)
         raise AnthropicError(
             "invalid_request_error",
             f"Multipart envelope still oversized ({e.size_kb:.0f}KB).",
             status=413,
         )
     except TokenExpiredError as e:
-        usage_mgr.record_failed(key_info.name, req.model)
-        _log_access(key_info.name, req.model, 401, time.time() - t0, last_user)
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 401, time.time() - t0, last_user)
         raise AnthropicError("authentication_error", str(e), status=401)
     except RuntimeError as e:
-        usage_mgr.record_failed(key_info.name, req.model)
-        _log_access(key_info.name, req.model, 502, time.time() - t0, last_user)
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 502, time.time() - t0, last_user)
         raise AnthropicError("api_error", str(e), status=502)
 
     # 流式：实时 SSE
-    if req.stream:
+    if stream:
         return StreamingResponse(
             anthropic_stream_from_worker(
                 node=node,
                 req_id=req_id,
-                model=req.model,
+                model=model,
                 after_ms=before_ms,
                 key_name=key_info.name,
             ),
@@ -730,8 +898,8 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
 
     reply = await bot_pool.poll_reply_by_req_id(node, req_id, after_ms=before_ms)
     if reply is None:
-        usage_mgr.record_failed(key_info.name, req.model)
-        _log_access(key_info.name, req.model, 504, time.time() - t0, last_user)
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 504, time.time() - t0, last_user)
         raise AnthropicError(
             "api_error",
             f"Bot did not respond within {config.POLL_TIMEOUT_S}s (req_id={req_id})",
@@ -741,7 +909,7 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
     duration = time.time() - t0
 
     if not reply.get("ok"):
-        usage_mgr.record_failed(key_info.name, req.model)
+        usage_mgr.record_failed(key_info.name, model)
         status = reply.get("status", 502)
         msg = reply.get("message", "upstream error")
         err_type = "rate_limit_error" if status == 429 else "api_error"
@@ -750,13 +918,13 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
         elif status == 400:
             err_type = "invalid_request_error"
         logger.warning("← [%s] [%s] req_id=%s FAIL status=%d msg=%s",
-                       key_info.name, req.model, req_id, status, msg[:120])
-        _log_access(key_info.name, req.model, status, duration, last_user)
+                       key_info.name, model, req_id, status, msg[:120])
+        _log_access(key_info.name, model, status, duration, last_user)
         raise AnthropicError(err_type, msg, status=status)
 
     raw = reply.get("raw_anthropic") or {}
     if not raw or "content" not in raw:
-        usage_mgr.record_failed(key_info.name, req.model)
+        usage_mgr.record_failed(key_info.name, model)
         raise AnthropicError("api_error", "Empty/invalid response from bot",
                              status=502)
 
@@ -764,16 +932,183 @@ async def messages_endpoint(req: MessagesRequest, request: Request):
     rusage = raw.get("usage") or {}
     in_tok = rusage.get("input_tokens", 0)
     out_tok = rusage.get("output_tokens", 0)
-    usage_mgr.record(key_info.name, req.model, in_tok, out_tok)
+    usage_mgr.record(key_info.name, model, in_tok, out_tok)
     bot_pool.record_usage(node, in_tok, out_tok)
 
     logger.info("← [%s] [%s] req_id=%s %.1fs in/out=%d/%d stop=%s",
-                key_info.name, req.model, req_id, duration,
+                key_info.name, model, req_id, duration,
                 in_tok, out_tok, raw.get("stop_reason"))
-    _log_access(key_info.name, req.model, 200, duration, last_user)
+    _log_access(key_info.name, model, 200, duration, last_user)
 
     # 非流式：直接返回 raw（即 MP 的原 Anthropic 响应）
     return raw
+
+
+# ============================================================================
+# /v1/responses —— OpenAI Responses API 入口
+# ============================================================================
+
+
+@app.post("/v1/responses")
+async def responses_endpoint(request: Request):
+    """OpenAI Responses API 入口。当前用于 GPT 系模型的原生 Responses 透传。"""
+    key_info = _check_auth(request)
+    t0 = time.time()
+    req_data = await _read_json_object(request)
+    model = str(req_data.get("model") or "")
+    stream = bool(req_data.get("stream", False))
+
+    if not model:
+        raise OpenAIError(
+            "invalid_request_error",
+            "model is required",
+            status=400,
+            code="missing_required_parameter",
+            param="model",
+        )
+    if not is_supported(model):
+        raise OpenAIError(
+            "invalid_request_error",
+            f"Unsupported model: {model}. Supported: {list_models()}",
+            status=400,
+            code="model_not_found",
+            param="model",
+        )
+    if to_endpoint(model) != "responses":
+        raise OpenAIError(
+            "invalid_request_error",
+            f"Model {model} is not configured for /v1/responses; use /v1/chat/completions.",
+            status=400,
+            code="unsupported_endpoint",
+            param="model",
+        )
+    if "input" not in req_data:
+        raise OpenAIError(
+            "invalid_request_error",
+            "input is required",
+            status=400,
+            code="missing_required_parameter",
+            param="input",
+        )
+
+    if key_info.rpm_limit:
+        ok, retry = rate_limiter.check_rpm(key_info.name, key_info.rpm_limit)
+        if not ok:
+            raise OpenAIError(
+                "rate_limit_error",
+                f"Rate limit ({key_info.rpm_limit}/min) exceeded, retry in {retry}s",
+                status=429,
+                code="rate_limit_exceeded",
+                retry_after=retry,
+            )
+    if key_info.daily_token_limit:
+        used = usage_mgr.daily_token_count(key_info.name)
+        if used >= key_info.daily_token_limit:
+            raise OpenAIError(
+                "rate_limit_error",
+                f"Daily token quota exhausted ({used}/{key_info.daily_token_limit})",
+                status=429,
+                code="daily_quota_exceeded",
+            )
+
+    last_user = _extract_response_input_text(req_data.get("input"))[:120]
+    req_id = uuid.uuid4().hex[:24]
+    before_ms = int(time.time() * 1000)
+    logger.info("→ [%s] [%s] req_id=%s mode=responses stream=%s last=%s",
+                key_info.name, model, req_id, stream, last_user[:60])
+
+    node = bot_pool.select()
+    if not node:
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 503, time.time() - t0, last_user)
+        raise OpenAIError("api_error", "No available bot nodes", status=503)
+    bot_pool.record_request(node)
+
+    payload: Dict[str, Any] = {
+        "_relay_v": 3,
+        "type": "req",
+        "req_id": req_id,
+        "endpoint": "responses",
+        "mode": "responses",
+        **req_data,
+    }
+    payload["stream"] = stream
+    # v3.0.0 workers build /v1/responses payload from `messages`; v3.0.1 workers
+    # drop this shim and keep native `input`.
+    payload["messages"] = req_data["input"]
+
+    try:
+        await bot_pool.send_request(node, payload)
+    except PayloadTooLargeError as e:
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 413, time.time() - t0, last_user)
+        raise OpenAIError(
+            "invalid_request_error",
+            f"Multipart envelope still oversized ({e.size_kb:.0f}KB).",
+            status=413,
+            param="input",
+        )
+    except TokenExpiredError as e:
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 401, time.time() - t0, last_user)
+        raise OpenAIError("authentication_error", str(e), status=401)
+    except RuntimeError as e:
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 502, time.time() - t0, last_user)
+        raise OpenAIError("api_error", str(e), status=502)
+
+    if stream:
+        return StreamingResponse(
+            responses_stream_from_worker(
+                node=node,
+                req_id=req_id,
+                model=model,
+                after_ms=before_ms,
+                key_name=key_info.name,
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    reply = await bot_pool.poll_reply_by_req_id(node, req_id, after_ms=before_ms)
+    if reply is None:
+        usage_mgr.record_failed(key_info.name, model)
+        _log_access(key_info.name, model, 504, time.time() - t0, last_user)
+        raise OpenAIError(
+            "api_error",
+            f"Bot did not respond within {config.POLL_TIMEOUT_S}s (req_id={req_id})",
+            status=504,
+        )
+
+    duration = time.time() - t0
+    if not reply.get("ok"):
+        usage_mgr.record_failed(key_info.name, model)
+        status = reply.get("status", 502)
+        msg = reply.get("message", "upstream error")
+        err_type = "rate_limit_error" if status == 429 else "api_error"
+        _log_access(key_info.name, model, status, duration, last_user)
+        raise OpenAIError(err_type, msg, status=status)
+
+    raw_response = reply.get("raw_response")
+    if not isinstance(raw_response, dict) and "content" in reply:
+        raw_response = _legacy_responses_object(
+            req_id=req_id,
+            model=model,
+            content=reply.get("content") or "",
+            usage=reply.get("usage") or {},
+        )
+    if not isinstance(raw_response, dict):
+        usage_mgr.record_failed(key_info.name, model)
+        raise OpenAIError("api_error", "Empty/invalid response from bot", status=502)
+
+    usage = _normalize_responses_usage(raw_response.get("usage") or reply.get("usage") or {})
+    usage_mgr.record(key_info.name, model, usage["prompt_tokens"], usage["completion_tokens"])
+    bot_pool.record_usage(node, usage["prompt_tokens"], usage["completion_tokens"])
+    _log_access(key_info.name, model, 200, duration, last_user)
+    return JSONResponse(content=raw_response)
 
 
 # ============================================================================
@@ -793,8 +1128,10 @@ async def list_models_endpoint(request: Request):
                 "created": 0,
                 "owned_by": "stepfun-relay",
                 "endpoints": (
-                    ["/v1/chat/completions", "/v1/messages"]
-                    if name.startswith("claude-")
+                    ["/v1/messages"]
+                    if is_claude_model(name)
+                    else ["/v1/chat/completions", "/v1/responses"]
+                    if to_endpoint(name) == "responses"
                     else ["/v1/chat/completions"]
                 ),
             }
@@ -828,10 +1165,12 @@ async def health():
 async def root():
     return {
         "service": "feishu-relay",
-        "version": "0.2.0",
-        "description": "OpenAI-compatible API via Feishu Bot tunnel",
+        "version": "3.0.1",
+        "description": "OpenAI / Anthropic-compatible API via Feishu Bot tunnel",
         "endpoints": {
             "chat": "POST /v1/chat/completions",
+            "messages": "POST /v1/messages",
+            "responses": "POST /v1/responses",
             "models": "GET /v1/models",
             "health": "GET /health",
             "admin_keys": "GET/POST/DELETE /admin/keys (admin only)",

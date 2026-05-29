@@ -22,6 +22,17 @@ from .stream_emitter import StreamEmitter
 
 logger = logging.getLogger("relay-bot")
 
+RELAY_META_KEYS = {
+    "_relay_v",
+    "type",
+    "req_id",
+    "endpoint",
+    "mode",
+    "node_id",
+    "payload_encoding",
+    "anthropic_headers",
+}
+
 
 class Worker:
     def __init__(self, cfg: Config):
@@ -255,11 +266,13 @@ class Worker:
     # MP 调用：非流式
     # ------------------------------------------------------------------
 
-    def _mp_post(self, path: str, payload: dict) -> tuple[int, dict]:
+    def _mp_post(self, path: str, payload: dict, extra_headers: Optional[dict[str, str]] = None) -> tuple[int, dict]:
         """非流式 MP 调用。"""
         headers = {"Content-Type": "application/json"}
         if self.cfg.mp_api_key:
             headers["Authorization"] = f"Bearer {self.cfg.mp_api_key}"
+        if extra_headers:
+            headers.update({k: v for k, v in extra_headers.items() if v})
         with httpx.Client(timeout=240) as cli:
             r = cli.post(
                 f"{self.cfg.mp_url}{path}",
@@ -274,31 +287,19 @@ class Worker:
 
     def _build_chat_payload(self, req: dict, *, stream: bool) -> tuple[str, dict]:
         """OpenAI chat/responses 模式的 MP 路径 + payload。"""
-        model = req.get("model", "")
-        messages = req.get("messages", [])
         endpoint = req.get("endpoint", "chat")
+        payload: dict[str, Any] = {
+            k: v for k, v in req.items()
+            if k not in RELAY_META_KEYS
+        }
+        payload["stream"] = stream
 
         if endpoint == "responses":
-            payload: dict[str, Any] = {
-                "model": model,
-                "input": messages,
-                "stream": stream,
-            }
-            if req.get("max_tokens"):
-                payload["max_tokens"] = req["max_tokens"]
-            if req.get("temperature") is not None:
-                payload["temperature"] = req["temperature"]
+            if "input" not in payload and "messages" in payload:
+                payload["input"] = payload["messages"]
+            payload.pop("messages", None)
             return "/v1/responses", payload
 
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-        }
-        if req.get("max_tokens"):
-            payload["max_tokens"] = req["max_tokens"]
-        if req.get("temperature") is not None:
-            payload["temperature"] = req["temperature"]
         return "/v1/chat/completions", payload
 
     def _call_mp_chat(self, req: dict) -> tuple[int, dict]:
@@ -309,17 +310,9 @@ class Worker:
             return status, data
 
         if path.endswith("/responses"):
-            output = data.get("output") or []
-            content = ""
-            for item in output:
-                if item.get("type") == "message":
-                    for c in item.get("content", []):
-                        if c.get("type") == "output_text":
-                            content += c.get("text", "")
             usage = data.get("usage") or {}
             return 200, {
-                "content": content,
-                "finish_reason": "stop",
+                "raw_response": data,
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
@@ -331,10 +324,11 @@ class Worker:
         if not choices:
             return 502, {"error": "no_choices", "message": "empty response"}
         choice = choices[0]
-        content = choice.get("message", {}).get("content", "")
+        message = choice.get("message", {}) or {}
+        content = message.get("content", "")
         finish = choice.get("finish_reason", "stop")
         usage = data.get("usage") or {}
-        return 200, {
+        result = {
             "content": content,
             "finish_reason": finish,
             "usage": {
@@ -343,16 +337,25 @@ class Worker:
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        reasoning_content = message.get("reasoning_content") or message.get("reasoning")
+        if reasoning_content:
+            result["reasoning_content"] = reasoning_content
+            result["reasoning"] = reasoning_content
+        return 200, result
 
     def _call_mp_messages_native(self, req: dict) -> tuple[int, dict]:
         """Anthropic messages 非流式直通 MP。"""
         payload = {
             k: v for k, v in req.items()
-            if k not in ("_relay_v", "req_id", "mode", "type", "node_id", "stream", "endpoint")
+            if k not in RELAY_META_KEYS and k != "stream"
         }
         payload["stream"] = False
 
-        status, mp_resp = self._mp_post("/v1/messages", payload)
+        status, mp_resp = self._mp_post(
+            "/v1/messages",
+            payload,
+            extra_headers=req.get("anthropic_headers"),
+        )
 
         if status == 200 and "content" in mp_resp:
             return 200, {
@@ -378,8 +381,9 @@ class Worker:
         """OpenAI chat/responses 流式：httpx.stream() + StreamEmitter。"""
         req_id = req.get("req_id", "")
         path, payload = self._build_chat_payload(req, stream=True)
+        is_responses = path.endswith("/responses")
         emitter = StreamEmitter(
-            self, chat_id, req_id, mode="chat",
+            self, chat_id, req_id, mode="responses" if is_responses else "chat",
             flush_bytes=self.cfg.stream_flush_bytes,
             flush_ms=self.cfg.stream_flush_ms,
             send_qps=self.cfg.stream_send_qps,
@@ -401,10 +405,15 @@ class Worker:
                         err_status = r.status_code
                         err_msg = r.read().decode("utf-8", errors="ignore")[:300]
                     else:
+                        cur_event: Optional[str] = None
                         for raw_line in r.iter_lines():
-                            if not raw_line:
-                                continue
                             line = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="ignore")
+                            if not line:
+                                cur_event = None
+                                continue
+                            if line.startswith("event:"):
+                                cur_event = line[6:].strip()
+                                continue
                             if not line.startswith("data:"):
                                 continue
                             data = line[5:].strip()
@@ -414,6 +423,17 @@ class Worker:
                                 obj = json.loads(data)
                             except Exception:
                                 continue
+
+                            if is_responses:
+                                event_type = cur_event or obj.get("type") or ""
+                                if event_type:
+                                    emitter.feed_event(event_type, obj)
+                                if event_type == "response.completed":
+                                    usage = (obj.get("response") or {}).get("usage") or obj.get("usage") or {}
+                                    prompt_tokens = usage.get("input_tokens", usage.get("prompt_tokens", prompt_tokens))
+                                    completion_tokens = usage.get("output_tokens", usage.get("completion_tokens", completion_tokens))
+                                continue
+
                             # OpenAI chat: {choices:[{delta:{content:"..."}, finish_reason:"..."}]}
                             choices = obj.get("choices") or []
                             if choices:
@@ -422,6 +442,9 @@ class Worker:
                                 text = delta.get("content")
                                 if text:
                                     emitter.feed_text(text)
+                                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                                if reasoning:
+                                    emitter.feed_thinking(reasoning)
                                 # tool_calls 增量
                                 tcs = delta.get("tool_calls")
                                 if tcs:
@@ -489,13 +512,15 @@ class Worker:
 
         payload = {
             k: v for k, v in req.items()
-            if k not in ("_relay_v", "req_id", "mode", "type", "node_id", "stream", "endpoint")
+            if k not in RELAY_META_KEYS and k != "stream"
         }
         payload["stream"] = True
 
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if self.cfg.mp_api_key:
             headers["Authorization"] = f"Bearer {self.cfg.mp_api_key}"
+        if req.get("anthropic_headers"):
+            headers.update({k: v for k, v in req["anthropic_headers"].items() if v})
 
         stop_reason = "end_turn"
         input_tokens = output_tokens = 0

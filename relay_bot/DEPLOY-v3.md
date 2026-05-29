@@ -1,6 +1,6 @@
 # Feishu Relay Worker v3 部署指引
 
-> 适用版本：`feishu-relay-bot 3.0.0`（git tag `relay-v3.0.0`）
+> 适用版本：`feishu-relay-bot 3.0.1`（git tag `relay-v3.0.1`）
 > 目标：在新机器上把一个 worker 节点接入线上 gateway（`47.97.3.198:9100`）
 
 ---
@@ -38,11 +38,11 @@ curl -sI https://models-proxy.example.com/v1/models | head -3
 
 ### 方式 A：从开发机直接 scp（推荐用于内测灰度）
 
-开发机已经构建好 `relay_bot/dist/feishu_relay_bot-3.0.0-py3-none-any.whl`：
+开发机已经构建好 `relay_bot/dist/feishu_relay_bot-3.0.1-py3-none-any.whl`：
 
 ```bash
 # 在开发机
-scp /path/to/ModelProxy/relay_bot/dist/feishu_relay_bot-3.0.0-py3-none-any.whl \
+scp /path/to/ModelProxy/relay_bot/dist/feishu_relay_bot-3.0.1-py3-none-any.whl \
     user@<目标机器>:/tmp/
 ```
 
@@ -59,18 +59,18 @@ docker compose up -d pypi
 验证：
 
 ```bash
-curl -s http://<分发机IP>:9080/simple/feishu-relay-bot/ | grep 3.0.0
+curl -s http://<分发机IP>:9080/simple/feishu-relay-bot/ | grep 3.0.1
 ```
 
 ### 方式 C：git clone 后本地 build（开发调试用）
 
 ```bash
 git clone <repo> ModelProxy && cd ModelProxy
-git checkout relay-v3.0.0
+git checkout relay-v3.0.1
 cd relay_bot
 python3 -m pip install --user --upgrade build
 python3 -m build --wheel
-ls dist/feishu_relay_bot-3.0.0-py3-none-any.whl
+ls dist/feishu_relay_bot-3.0.1-py3-none-any.whl
 ```
 
 ---
@@ -90,21 +90,21 @@ source .venv/bin/activate
 
 # —— 方式 A 用 wheel ——
 pip install --upgrade pip
-pip install /tmp/feishu_relay_bot-3.0.0-py3-none-any.whl
+pip install /tmp/feishu_relay_bot-3.0.1-py3-none-any.whl
 
 # —— 方式 B 用内网 PyPI ——
 pip install --upgrade pip
 pip install \
   --index-url http://<分发机IP>:9080/simple/ \
   --trusted-host <分发机IP> \
-  feishu-relay-bot==3.0.0
+  feishu-relay-bot==3.0.1
 ```
 
 验证：
 
 ```bash
 feishu-relay-bot version
-# 期望输出：feishu-relay-bot 3.0.0
+# 期望输出：feishu-relay-bot 3.0.1
 ```
 
 ---
@@ -177,12 +177,12 @@ feishu-relay-bot run --config /etc/relay-bot/config.yaml
 期望日志（关键行）：
 
 ```
-relay-bot: feishu-relay-bot v3.0.0
+relay-bot: feishu-relay-bot v3.0.1
 relay-bot:   node_id: bot-<你设的>
 relay-bot:   mp_url:  https://models-proxy.example.com
 relay-bot: 连接飞书 WebSocket (node_id=bot-<你设的>) ...
 Lark: connected to wss://msg-frontier.feishu.cn/ws/v2?...
-relay-bot.heartbeat: heartbeat sent: node_id=... version=3.0.0 load=...
+relay-bot.heartbeat: heartbeat sent: node_id=... version=3.0.1 load=...
 ```
 
 只要看到 `connected to wss://` + 30 秒间隔的 `heartbeat sent`，worker 就站起来了。
@@ -211,7 +211,7 @@ sudo journalctl -u llm-relay --since '2 minutes ago' --no-pager \
 [hb-v3] caps missing 'relay_v3' — disabling node=...
 ```
 
-说明 worker 装的不是 3.0.0，回到第 3 步重装。
+说明 worker 装的不是 3.0.1，回到第 3 步重装。
 
 ---
 
@@ -295,7 +295,7 @@ curl -sN https://<gateway域名>/v1/chat/completions \
 1. worker 日志有没有 `connected to wss://`？没有 → 网络问题，nc/curl 排查飞书域名
 2. worker 日志有没有 `heartbeat sent`？没有 → 看 ERROR 行
 3. gateway 日志 grep `<node_id>` → 没有 → 大概率 `chat_id` 配错
-4. gateway 看到 `caps missing 'relay_v3'` → wheel 不是 3.0.0
+4. gateway 看到 `caps missing 'relay_v3'` → wheel 不是 3.0.1
 
 ### 10.3 请求 504 Gateway Timeout
 

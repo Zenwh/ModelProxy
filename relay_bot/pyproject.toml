@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "feishu-relay-bot"
-version = "3.0.0"
+version = "3.0.1"
 description = "Feishu Relay Bot — 飞书消息通道 AI 中继节点"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -68,6 +68,14 @@ async def openai_stream_from_worker(
                 text = delta.get("text") or ""
                 if text:
                     yield _openai_chunk(req_id, model, {"content": text}, None)
+                thinking = delta.get("thinking") or delta.get("reasoning_content") or delta.get("reasoning")
+                if thinking:
+                    yield _openai_chunk(
+                        req_id,
+                        model,
+                        {"reasoning_content": thinking, "reasoning": thinking},
+                        None,
+                    )
                 tool = delta.get("tool_use")
                 if tool and isinstance(tool, dict):
                     # OpenAI tool_calls 增量格式
@@ -121,6 +129,19 @@ async def openai_stream_from_worker(
                                         },
                                     }],
                                 }, None)
+                        elif et == "response.output_text.delta":
+                            t = ed.get("delta") or ""
+                            if t:
+                                yield _openai_chunk(req_id, model, {"content": t}, None)
+                        elif et in ("response.reasoning_text.delta", "response.reasoning_summary_text.delta"):
+                            t = ed.get("delta") or ""
+                            if t:
+                                yield _openai_chunk(
+                                    req_id,
+                                    model,
+                                    {"reasoning_content": t, "reasoning": t},
+                                    None,
+                                )
                         # message_delta / message_stop 由下方 resp 分支统一收尾，不在这里 yield finish
             elif ptype == "resp":
                 got_resp = True
@@ -175,6 +196,7 @@ async def anthropic_stream_from_worker(
     p_tok = c_tok = 0
     stop_reason = "end_turn"
     got_resp = False
+    forwarded_native_events = False
     err_msg: Optional[str] = None
 
     def _start_message_event(input_tokens: int = 0) -> str:
@@ -225,9 +247,7 @@ async def anthropic_stream_from_worker(
                 # 优先：worker 直接预编排好的 events 列表
                 events = delta.get("events")
                 if events and isinstance(events, list):
-                    if not started:
-                        yield _start_message_event(0)
-                        started = True
+                    forwarded_native_events = True
                     for ev in events:
                         et = ev.get("event") or ev.get("type")
                         ed = ev.get("data") or ev
@@ -262,6 +282,19 @@ async def anthropic_stream_from_worker(
         logger.exception("anthropic_stream error req_id=%s", req_id)
         err_msg = f"stream_error: {type(e).__name__}: {e}"
 
+    if forwarded_native_events:
+        if err_msg:
+            yield _sse_event("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": err_msg},
+            })
+        if got_resp and (p_tok or c_tok):
+            usage_mgr.record(key_name, model, p_tok, c_tok)
+            bot_pool.record_usage(node, p_tok, c_tok)
+        elif not got_resp:
+            usage_mgr.record_failed(key_name, model)
+        return
+
     # 若全程没收到 chunk，至少发个空 message_start
     if not started:
         yield _start_message_event(p_tok)
@@ -289,6 +322,90 @@ async def anthropic_stream_from_worker(
         yield _sse_event("error", {
             "type": "error",
             "error": {"type": "api_error", "message": err_msg},
+        })
+
+    if got_resp and (p_tok or c_tok):
+        usage_mgr.record(key_name, model, p_tok, c_tok)
+        bot_pool.record_usage(node, p_tok, c_tok)
+    elif not got_resp:
+        usage_mgr.record_failed(key_name, model)
+
+
+async def responses_stream_from_worker(
+    *,
+    node: BotNode,
+    req_id: str,
+    model: str,
+    after_ms: int,
+    key_name: str,
+) -> AsyncIterator[str]:
+    """OpenAI Responses API 原生流式 SSE 生成器。"""
+    got_resp = False
+    completed = False
+    p_tok = c_tok = 0
+    err_msg: Optional[str] = None
+
+    try:
+        async for parsed in bot_pool.poll_stream(node, req_id, after_ms=after_ms):
+            ptype = parsed.get("type")
+            if ptype == "stream_chunk":
+                delta = parsed.get("delta") or {}
+                events = delta.get("events")
+                if events and isinstance(events, list):
+                    for ev in events:
+                        et = ev.get("event") or ev.get("type")
+                        ed = ev.get("data") if isinstance(ev.get("data"), dict) else ev
+                        if not et and isinstance(ed, dict):
+                            et = ed.get("type")
+                        if not et:
+                            continue
+                        if et == "response.completed" and isinstance(ed, dict):
+                            completed = True
+                            usage = (ed.get("response") or {}).get("usage") or ed.get("usage") or {}
+                            p_tok = int(usage.get("input_tokens") or usage.get("prompt_tokens") or p_tok)
+                            c_tok = int(usage.get("output_tokens") or usage.get("completion_tokens") or c_tok)
+                        yield _sse_event(et, ed)
+                    continue
+
+                text = delta.get("text") or ""
+                if text:
+                    yield _sse_event("response.output_text.delta", {
+                        "type": "response.output_text.delta",
+                        "delta": text,
+                    })
+
+            elif ptype == "resp":
+                got_resp = True
+                if not parsed.get("ok", True):
+                    err_msg = parsed.get("message") or parsed.get("error") or "upstream_error"
+                usage = parsed.get("usage") or {}
+                p_tok = int(usage.get("prompt_tokens") or usage.get("input_tokens") or p_tok)
+                c_tok = int(usage.get("completion_tokens") or usage.get("output_tokens") or c_tok)
+                break
+    except Exception as e:
+        logger.exception("responses_stream error req_id=%s", req_id)
+        err_msg = f"stream_error: {type(e).__name__}: {e}"
+
+    if err_msg:
+        yield _sse_event("error", {
+            "type": "error",
+            "error": {"type": "api_error", "message": err_msg},
+        })
+    elif got_resp and not completed:
+        yield _sse_event("response.completed", {
+            "type": "response.completed",
+            "response": {
+                "id": f"resp_{req_id}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "model": model,
+                "status": "completed",
+                "usage": {
+                    "input_tokens": p_tok,
+                    "output_tokens": c_tok,
+                    "total_tokens": p_tok + c_tok,
+                },
+            },
         })
 
     if got_resp and (p_tok or c_tok):

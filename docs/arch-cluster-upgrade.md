@@ -1,6 +1,6 @@
 # Feishu Relay v3 — 集群升级指南
 
-> 适用版本：`feishu-relay-bot 3.0.0` + gateway commit ≥ `relay-v3.0.0` tag
+> 适用版本：`feishu-relay-bot 3.0.1` + gateway commit ≥ `relay-v3.0.1` tag
 > 目标：1000k 上下文、真流式、多 worker 平摊负载
 
 ---
@@ -93,8 +93,8 @@ gateway 启动 / 收心跳时校验 `relay_v3 in caps`；缺失则
 
 ### 2.2 单 worker 部署
 
-1. 把 `feishu_relay_bot-3.0.0-py3-none-any.whl` scp 到目标主机。
-2. `pip install --upgrade feishu_relay_bot-3.0.0-py3-none-any.whl`。
+1. 把 `feishu_relay_bot-3.0.1-py3-none-any.whl` scp 到目标主机。
+2. `pip install --upgrade feishu_relay_bot-3.0.1-py3-none-any.whl`。
 3. 复制 `config.example.yaml` → `config.yaml`，填实 `feishu.app_secret`、
    `mp.api_key`、`chat_id`、`node_id`。`node_id` 在同一 chat 内**必须唯一**。
 4. `feishu-relay-bot run --config config.yaml`（或 systemd 拉起）。
@@ -112,7 +112,7 @@ gateway 启动 / 收心跳时校验 `relay_v3 in caps`；缺失则
 ### 2.4 capability 强校验
 
 - 心跳缺 `relay_v3` → gateway 自动 `enabled=false` 并打 WARNING；
-- dashboard `/admin/nodes` 该节点红色，运维需把对应主机的 wheel 升级到 3.0.0
+- dashboard `/admin/nodes` 该节点红色，运维需把对应主机的 wheel 升级到 3.0.1
   并重启。
 
 ---

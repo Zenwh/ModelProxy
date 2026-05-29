@@ -30,6 +30,10 @@ MODELS = {
     # OpenAI Chat
     "kimi-k2.6":          {"mp_name": "kimi-k2.6",         "endpoint": "chat",      "vendor": "moonshot", "fallback": ["kimi-k2.6-aliyun"]},
     "glm-5.1":            {"mp_name": "glm-5.1",           "endpoint": "chat",      "vendor": "zhipu",    "fallback": ["glm-5.1-aliyun"]},
+    "deepseek-v3.2-think-ks": {"mp_name": "deepseek-v3.2-think-ks", "endpoint": "chat", "vendor": "deepseek", "fallback": []},
+    "deepseek-v3.2-ks":   {"mp_name": "deepseek-v3.2-ks",  "endpoint": "chat",      "vendor": "deepseek", "fallback": []},
+    "ccr/deepseek-v3.2-think-ks": {"mp_name": "ccr/deepseek-v3.2-think-ks", "endpoint": "chat", "vendor": "deepseek", "fallback": []},
+    "ccr/deepseek-v3.2-ks": {"mp_name": "ccr/deepseek-v3.2-ks", "endpoint": "chat", "vendor": "deepseek", "fallback": []},
     "deepseek-v4-pro":    {"mp_name": "deepseek-v4-pro",   "endpoint": "chat",      "vendor": "deepseek", "fallback": []},
     "deepseek-v4-flash":  {"mp_name": "deepseek-v4-flash", "endpoint": "chat",      "vendor": "deepseek", "fallback": []},
 }

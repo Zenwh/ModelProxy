@@ -3,7 +3,7 @@
 #
 # 用法（在目标机器上）：
 #   sudo NODE_ID=bot-cn-shanghai-01 \
-#        WHEEL=/tmp/feishu_relay_bot-3.0.0-py3-none-any.whl \
+#        WHEEL=/tmp/feishu_relay_bot-3.0.1-py3-none-any.whl \
 #        bash install.sh
 #
 # 或者从内网 PyPI 装：
@@ -63,13 +63,13 @@ elif [ -n "$PYPI_HOST" ]; then
   "$INSTALL_DIR/.venv/bin/pip" install --quiet \
     --index-url "http://$PYPI_HOST:$PYPI_PORT/simple/" \
     --trusted-host "$PYPI_HOST" \
-    "feishu-relay-bot==3.0.0"
+    "feishu-relay-bot==3.0.1"
 else
   err "需要设置 WHEEL=<path> 或 PYPI_HOST=<host>"
 fi
 
 VER=$("$INSTALL_DIR/.venv/bin/feishu-relay-bot" version | awk '{print $2}')
-[ "$VER" = "3.0.0" ] || err "安装版本 $VER 非 3.0.0"
+[ "$VER" = "3.0.1" ] || err "安装版本 $VER 非 3.0.1"
 log "feishu-relay-bot $VER 安装成功"
 
 # 4. 配置文件

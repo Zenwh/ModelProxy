@@ -2,7 +2,7 @@
 #
 # Build:
 #   cd relay_bot
-#   docker build -t feishu-relay-bot:3.0.0 .
+#   docker build -t feishu-relay-bot:3.0.1 .
 #
 # Or via docker compose from repo root:
 #   docker compose up -d worker-local --build
@@ -20,9 +20,9 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 2) 装 wheel（构建上下文必须是 relay_bot/，否则找不到 dist/）
-COPY dist/feishu_relay_bot-3.0.0-py3-none-any.whl /tmp/
-RUN pip install /tmp/feishu_relay_bot-3.0.0-py3-none-any.whl \
-    && rm /tmp/feishu_relay_bot-3.0.0-py3-none-any.whl
+COPY dist/feishu_relay_bot-3.0.1-py3-none-any.whl /tmp/
+RUN pip install /tmp/feishu_relay_bot-3.0.1-py3-none-any.whl \
+    && rm /tmp/feishu_relay_bot-3.0.1-py3-none-any.whl
 
 # 3) 非 root 跑（容器内不需要任何特权）
 RUN useradd --system --uid 10001 --shell /usr/sbin/nologin relay \
