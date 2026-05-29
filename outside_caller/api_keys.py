@@ -44,17 +44,16 @@ class APIKeyManager:
 
     def _load(self):
         if not os.path.exists(self._file):
-            logger.info("api_keys 文件不存在，将 fallback 到 config.RELAY_API_KEY")
-            # 兼容旧的单 key 模式
-            if config.RELAY_API_KEY:
-                legacy = KeyInfo(
-                    key=config.RELAY_API_KEY,
-                    name="default",
-                    created_at="2026-01-01T00:00:00",
-                    enabled=True,
-                    is_admin=True,
-                )
-                self._keys[legacy.key] = legacy
+            # Require the api_keys JSON file to exist.  Falling back to the single
+            # RELAY_API_KEY env var and quietly granting it admin would let anyone
+            # who knows (or guesses) that well-known default value take full admin
+            # control of the relay, so we no longer do that.
+            logger.info(
+                "api_keys 文件不存在 (%s)。"
+                "先运行 'python -m outside_caller.keys create <name>' 创建 key，"
+                "或将 RELAY_API_KEY 写入 %s。",
+                self._file, self._file,
+            )
             return
 
         with open(self._file) as f:
@@ -76,17 +75,15 @@ class APIKeyManager:
 
     def _save(self):
         os.makedirs(os.path.dirname(self._file), exist_ok=True)
-        data = {
+        config.atomic_write_json(self._file, {
             "keys": [asdict(k) for k in self._keys.values()],
-        }
-        with open(self._file, "w") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        })
         logger.info("api_keys 已保存 (%d 个)", len(self._keys))
 
     # ---- CRUD ----------------------------------------------------------------
 
     def validate(self, key: str) -> Optional[KeyInfo]:
-        """验证 key。返回 KeyInfo 或 None（无效/被禁用）。"""
+        """验证 key（仅完整 key）。返回 KeyInfo 或 None（无效/被禁用）。"""
         info = self._keys.get(key)
         if info and info.enabled:
             return info
@@ -111,7 +108,10 @@ class APIKeyManager:
     def revoke_key(self, key: str) -> bool:
         """禁用 key。返回是否成功。"""
         with self._lock:
-            info = self._keys.get(key)
+            resolved = self._resolve_key(key)
+            if resolved is None:
+                return False
+            info = self._keys[resolved]
             if not info:
                 return False
             info.enabled = False
@@ -122,7 +122,10 @@ class APIKeyManager:
     def enable_key(self, key: str) -> bool:
         """重新启用 key。"""
         with self._lock:
-            info = self._keys.get(key)
+            resolved = self._resolve_key(key)
+            if resolved is None:
+                return False
+            info = self._keys[resolved]
             if not info:
                 return False
             info.enabled = True
@@ -144,7 +147,10 @@ class APIKeyManager:
         要清空请用 clear_rpm=True 或 clear_daily=True。
         """
         with self._lock:
-            info = self._keys.get(key)
+            resolved = self._resolve_key(key)
+            if resolved is None:
+                return False
+            info = self._keys[resolved]
             if not info:
                 return False
             if clear_rpm:
@@ -165,10 +171,11 @@ class APIKeyManager:
     def delete_key(self, key: str) -> bool:
         """永久删除 key。"""
         with self._lock:
-            if key not in self._keys:
+            resolved = self._resolve_key(key)
+            if resolved not in self._keys:
                 return False
-            name = self._keys[key].name
-            del self._keys[key]
+            name = self._keys[resolved].name
+            del self._keys[resolved]
             self._save()
             logger.info("删除 key: name=%s", name)
             return True
@@ -176,6 +183,19 @@ class APIKeyManager:
     def list_keys(self) -> List[KeyInfo]:
         """列出所有 key（含禁用的）。"""
         return list(self._keys.values())
+
+    def _resolve_key(self, key_or_prefix: str) -> Optional[str]:
+        """
+        通过完整 key 或 prefix 找到存储的真实 key 字符串。
+        - 精确匹配直接返回。
+        - 否则按 prefix 找唯一匹配；无或多则返回 None（上层报 404/409）。
+        """
+        if key_or_prefix in self._keys:
+            return key_or_prefix
+        matches = [k for k in self._keys if k.startswith(key_or_prefix)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def is_admin(self, key: str) -> bool:
         """检查是否是 admin key。"""

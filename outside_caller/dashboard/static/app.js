@@ -6,7 +6,7 @@ const API_BASE = window.location.pathname.replace(/\/admin\/dashboard.*$/, '');
 const STORAGE_KEY = 'llm-relay-admin-key';
 
 let adminKey = null;
-let currentKeys = [];     // 缓存最近一次拉的 key 列表（含 full key）
+let currentKeys = [];     // 缓存最近一次拉的 key 列表（仅 key_prefix，不含 full key）
 let selectedKey = null;
 
 // ---- 工具 -----------------------------------------------------------------
@@ -200,7 +200,7 @@ async function showDetailByIdx(idx) {
   if (!k) return;
   selectedKey = k;
   try {
-    const detail = await api(`/admin/keys/${encodeURIComponent(k.key)}/usage`);
+    const detail = await api(`/admin/keys/${encodeURIComponent(k.key_prefix)}/usage`);
     renderDetail(detail, k);
     show('detail-section');
     $('detail-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -271,7 +271,7 @@ async function saveLimits() {
   if (dailyRaw !== '') body.daily_token_limit = parseInt(dailyRaw);
   try {
     $('limit-status').textContent = '保存中…';
-    await api(`/admin/keys/${encodeURIComponent(selectedKey.key)}`, {
+    await api(`/admin/keys/${encodeURIComponent(selectedKey.key_prefix)}`, {
       method: 'PATCH',
       body,
     });
@@ -288,7 +288,7 @@ async function revokeByIdx(idx) {
   const k = currentKeys[idx];
   if (!confirm(`确认禁用 key 「${k.name}」?`)) return;
   try {
-    await api(`/admin/keys/${encodeURIComponent(k.key)}`, { method: 'DELETE' });
+    await api(`/admin/keys/${encodeURIComponent(k.key_prefix)}`, { method: 'DELETE' });
     await refresh();
   } catch (e) {
     alert('禁用失败：' + e.message);
@@ -298,7 +298,7 @@ async function revokeByIdx(idx) {
 async function enableByIdx(idx) {
   const k = currentKeys[idx];
   try {
-    await api(`/admin/keys/${encodeURIComponent(k.key)}`, {
+    await api(`/admin/keys/${encodeURIComponent(k.key_prefix)}`, {
       method: 'PATCH',
       body: { enabled: true },
     });
@@ -310,11 +310,12 @@ async function enableByIdx(idx) {
 
 async function copyKey(idx) {
   const k = currentKeys[idx];
+  if (!k?.key) return;
   try {
     await navigator.clipboard.writeText(k.key);
-    alert(`已复制 key 「${k.name}」 到剪贴板`);
+    alert('已复制完整 key 到剪贴板');
   } catch (e) {
-    prompt('请手动复制：', k.key);
+    alert(`Key: ${k.key_prefix}\n完整 key: ${k.key}`);
   }
 }
 

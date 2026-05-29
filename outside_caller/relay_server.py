@@ -17,6 +17,8 @@ Feishu-as-Tunnel LLM Relay Service
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -33,10 +35,10 @@ from pydantic import BaseModel, Field
 
 from . import config
 from .api_keys import KeyInfo, manager as key_mgr
-from .bot_pool import pool as bot_pool
+from .bot_pool import close_http_client, pool as bot_pool
 from .errors import AnthropicError, OpenAIError, error_handler, validation_error_handler
 from .feishu_token import TokenExpiredError, token_mgr
-from .models import is_supported, list_models, to_mp_name, to_endpoint
+from .models import is_supported, list_models, to_endpoint
 from .rate_limit import RateLimiter
 from .relay_codec import PayloadTooLargeError
 from .slot_pool import slot_pool
@@ -72,16 +74,34 @@ def _init_access_log():
     _access_logger.addHandler(handler)
 
 
+def _extract_user_text(content) -> str:
+    """从 message content（str 或 list）提取纯文本用于日志。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "image_url":
+                    parts.append("[image]")
+            elif isinstance(item, str):
+                parts.append(item)
+        return " ".join(parts)
+    return str(content)
+
+
 def _log_access(
     key_name: str,
     model: str,
     status: int,
     duration_s: float,
-    user_text: str,
+    user_text: Any,
 ):
     if _access_logger:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        snippet = user_text[:60].replace("\n", " ")
+        snippet = _extract_user_text(user_text)[:60].replace("\n", " ")
         _access_logger.info(
             '%s | %s | %s | %d | %.1fs | "%s"',
             ts, key_name, model, status, duration_s, snippet,
@@ -133,6 +153,10 @@ async def _lifespan(app: FastAPI):
         await task_hb_poll
     except asyncio.CancelledError:
         pass
+    try:
+        await close_http_client()
+    except Exception:
+        pass
 
 
 app = FastAPI(
@@ -166,7 +190,7 @@ if _DASHBOARD_DIR.exists():
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Any  # str | List[dict] for vision/image_url support
 
 
 class ChatRequest(BaseModel):
@@ -273,6 +297,50 @@ def _check_admin(request: Request) -> KeyInfo:
     return info
 
 
+# ---- Agent 心跳鉴权（X-Agent-Secret HMAC 固定密码 / HMAC-SHA256，取其一） -----
+
+_AGENT_HMAC_HEADER = "X-Agent-Secret"
+
+
+async def _verify_agent(request: Request) -> None:
+    """
+    Verify X-Agent-Secret.
+
+    Two accepted modes:
+    1. Agent sends AGENT_SECRET in plain: header == config.AGENT_SECRET.
+       Fastest, no body read needed; good for internal/trusted tunnels.
+    2. Agent sends HMAC-SHA256 of body: hex digest must be
+       hmac.compare_digest(sent, hmac.new(AGENT_SECRET, body, sha256).hexdigest()).
+       Body must contain a fresh "timestamp" (Unix seconds, ±60s) to prevent replay.
+    """
+    provided = request.headers.get(_AGENT_HMAC_HEADER, "")
+    if not provided:
+        raise HTTPException(status_code=401, detail="missing X-Agent-Secret")
+
+    # Mode 1: plain shared-secret comparison (constant-time)
+    if hmac.compare_digest(provided, config.AGENT_SECRET):
+        return
+
+    # Mode 2: HMAC-SHA256 of request body
+    body: bytes = await request.body()
+    expected = hmac.new(
+        config.AGENT_SECRET.encode("utf-8"), body, hashlib.sha256,
+    ).hexdigest()
+    if hmac.compare_digest(provided, expected):
+        # Replay protection: require a fresh timestamp in body
+        try:
+            payload = json.loads(body)
+            ts = int(payload.get("timestamp", 0))
+            now = int(time.time())
+            if abs(now - ts) <= 60:
+                return
+        except Exception:
+            pass
+        raise HTTPException(status_code=403, detail="request expired or missing timestamp")
+
+    raise HTTPException(status_code=403, detail="invalid X-Agent-Secret")
+
+
 # ============================================================================
 # 核心接口
 # ============================================================================
@@ -318,12 +386,12 @@ async def chat_completions(req: ChatRequest, request: Request):
     last_user = ""
     for m in reversed(req.messages):
         if m.role == "user":
-            last_user = m.content
+            last_user = _extract_user_text(m.content)
             break
 
     # 构造 relay 协议 payload
+    # model 传 public 名透传给 bot，由 bot 端 ModelRegistry 翻译成上游名 + 路由到对应 endpoint
     req_id = uuid.uuid4().hex[:24]
-    mp_model = to_mp_name(req.model) or req.model
     endpoint = to_endpoint(req.model) or "chat"
 
     # v3：超过 MAX_INPUT_TOKENS 时中间截断
@@ -367,7 +435,7 @@ async def chat_completions(req: ChatRequest, request: Request):
         "_relay_v": 3,
         "type": "req",
         "req_id": req_id,
-        "model": mp_model,
+        "model": req.model,
         "endpoint": endpoint,
         "mode": None,
         "stream": bool(req.stream),
@@ -503,6 +571,9 @@ def _sse_chunk(req_id: str, model: str, delta: dict, finish_reason: Optional[str
         }],
     }
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+
 
 
 # ============================================================================
@@ -798,7 +869,7 @@ async def admin_list_keys(request: Request):
         "total": len(keys),
         "keys": [
             {
-                "key": k.key,                       # admin 自己看可以拿完整 key
+                "key": k.key,                        # admin 有权限查看完整 key
                 "key_prefix": k.key[:12] + "***",
                 "name": k.name,
                 "enabled": k.enabled,
@@ -815,8 +886,11 @@ async def admin_list_keys(request: Request):
 @app.delete("/admin/keys/{key}")
 async def admin_revoke_key(key: str, request: Request):
     _check_admin(request)
-    if key_mgr.revoke_key(key):
-        return {"status": "revoked", "key_prefix": key[:12] + "***"}
+    resolved = key_mgr._resolve_key(key)
+    if resolved is None:
+        raise OpenAIError("not_found_error", "Key not found", status=404)
+    if key_mgr.revoke_key(resolved):
+        return {"status": "revoked", "key_prefix": resolved[:12] + "***"}
     raise OpenAIError("not_found_error", "Key not found", status=404)
 
 
@@ -832,13 +906,14 @@ class PatchKeyRequest(BaseModel):
 async def admin_patch_key(key: str, req: PatchKeyRequest, request: Request):
     _check_admin(request)
 
-    if key not in key_mgr._keys:
+    resolved = key_mgr._resolve_key(key)
+    if resolved is None or resolved not in key_mgr._keys:
         raise OpenAIError("not_found_error", "Key not found", status=404)
 
     if req.enabled is True:
-        key_mgr.enable_key(key)
+        key_mgr.enable_key(resolved)
     elif req.enabled is False:
-        key_mgr.revoke_key(key)
+        key_mgr.revoke_key(resolved)
 
     if (
         req.rpm_limit is not None
@@ -847,14 +922,14 @@ async def admin_patch_key(key: str, req: PatchKeyRequest, request: Request):
         or req.clear_daily
     ):
         key_mgr.set_limits(
-            key,
+            resolved,
             rpm_limit=req.rpm_limit,
             daily_token_limit=req.daily_token_limit,
             clear_rpm=req.clear_rpm,
             clear_daily=req.clear_daily,
         )
 
-    info = key_mgr._keys[key]
+    info = key_mgr._keys[resolved]
     return {
         "key_prefix": info.key[:12] + "***",
         "name": info.name,
@@ -868,18 +943,20 @@ async def admin_patch_key(key: str, req: PatchKeyRequest, request: Request):
 @app.get("/admin/keys/{key}/usage")
 async def admin_key_usage(key: str, request: Request):
     _check_admin(request)
-    info = key_mgr._keys.get(key)
-    if not info:
+    resolved = key_mgr._resolve_key(key)
+    if resolved is None or resolved not in key_mgr._keys:
         raise OpenAIError("not_found_error", "Key not found", status=404)
+    info = key_mgr._keys[resolved]
+    name = info.name
 
-    stats = usage_mgr.get(info.name)
-    daily = usage_mgr.daily_token_count(info.name)
-    current_rpm = rate_limiter.rpm_current(info.name)
+    stats = usage_mgr.get(name)
+    daily = usage_mgr.daily_token_count(name)
+    current_rpm = rate_limiter.rpm_current(name)
 
     if stats is None:
         return {
-            "key_prefix": info.key[:12] + "***",
-            "name": info.name,
+            "key_prefix": resolved[:12] + "***",
+            "name": name,
             "total_requests": 0,
             "total_prompt_tokens": 0,
             "total_completion_tokens": 0,
@@ -894,8 +971,8 @@ async def admin_key_usage(key: str, request: Request):
         }
 
     return {
-        "key_prefix": info.key[:12] + "***",
-        "name": info.name,
+        "key_prefix": resolved[:12] + "***",
+        "name": name,
         "total_requests": stats.total_requests,
         "total_prompt_tokens": stats.total_prompt_tokens,
         "total_completion_tokens": stats.total_completion_tokens,
@@ -920,7 +997,6 @@ async def admin_usage_summary(request: Request):
     for key_info in key_mgr.list_keys():
         s = all_stats.get(key_info.name)
         per_key.append({
-            "key": key_info.key,                       # admin 看完整 key
             "key_prefix": key_info.key[:12] + "***",
             "name": key_info.name,
             "enabled": key_info.enabled,
@@ -982,8 +1058,9 @@ async def admin_list_nodes(request: Request):
 
 
 @app.get("/api/discovery")
-async def api_discovery():
-    """服务发现：返回 bot 列表（公开接口）。"""
+async def api_discovery(request: Request):
+    """服务发现：返回 bot 列表（需鉴权）。"""
+    _check_auth(request)
     nodes = bot_pool.list_all()
     return {
         "total": len(nodes),
@@ -1322,6 +1399,7 @@ async def admin_upgrade_all(req: CtrlRequest, request: Request):
 @app.post("/agent/heartbeat")
 async def agent_heartbeat(request: Request):
     """Bot 主动上报心跳，注册/更新节点。"""
+    await _verify_agent(request)
     body = await request.json()
     node_id = body.get("node_id")
     if not node_id:
@@ -1353,6 +1431,7 @@ async def agent_heartbeat(request: Request):
 @app.post("/agent/offline")
 async def agent_offline(request: Request):
     """Bot 主动下线通知。"""
+    await _verify_agent(request)
     body = await request.json()
     node_id = body.get("node_id")
     if not node_id:

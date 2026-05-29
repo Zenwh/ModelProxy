@@ -73,11 +73,9 @@ class UsageManager:
 
     def _save(self):
         os.makedirs(os.path.dirname(self._file), exist_ok=True)
-        with open(self._file, "w") as f:
-            json.dump(
-                {"stats": {k: asdict(v) for k, v in self._stats.items()}},
-                f, indent=2, ensure_ascii=False,
-            )
+        config.atomic_write_json(self._file, {
+            "stats": {k: asdict(v) for k, v in self._stats.items()},
+        })
 
     # ---- 记录 ---------------------------------------------------------------
 

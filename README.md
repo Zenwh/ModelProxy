@@ -1,123 +1,116 @@
-# ModelProxy
+# feishu-relay-gateway
 
-> LLM API 中转 & 渠道分发平台 - 产品 PRD & 高保真 Demo
+`feishu-relay` 系统的 **Gateway** 端 — 给 [`relay_bot/`](relay_bot/) 子目录下的 bot 节点提供心跳接入、请求中转、客户端 API key 管理。对外暴露 OpenAI / Anthropic 兼容 API，把请求经飞书消息隧道派发给内网 bot 节点。
 
----
+> v3 起 bot 主仓即本仓 [`relay_bot/`](relay_bot/) 子目录。
+> 老的独立仓库 [`Zenwh/feishu-relay-bot`](https://github.com/Zenwh/feishu-relay-bot) 已 archive，不再接受 issue / PR。
 
-## 仓库结构
+## 架构
 
 ```
-ModelProxy/
-├── README.md                       # 本文件
-├── API.md                          # 已有 API 文档（不动）
-├── 资源池切分方案.md                  # 已有底层切分方案（不动）
-├── PRD/                            # 产品 PRD 文档
-│   ├── 00-Overview.md              #   产品总览 / 架构 / 角色 / 术语
-│   ├── 01-Resource-Management.md   #   模型 / 供应商管理
-│   ├── 02-Channel-Management.md    #   渠道管理（核心）
-│   ├── 03-Channel-Console.md       #   渠道运营后台
-│   ├── 04-Reconciliation.md        #   对账中心（双轨）
-│   ├── 05-Data-Model.md            #   数据模型 / API
-│   └── 06-Demo-Plan.md             #   Demo 页面清单
-└── demo/                           # 高保真 Demo（HTML/CSS/JS）
-    ├── index.html                  #   入口门厅
-    ├── platform-admin/             #   平台运营后台（深色主题）
-    └── channel-console/            #   渠道运营后台（浅色主题）
+                   ┌──────────────────────────────────────────┐
+   OpenAI/         │                  Gateway                  │
+   Anthropic SDK   │  outside_caller/relay_server.py:9100     │
+   ───────────►   │                                          │
+                   │  - /v1/chat/completions, /v1/messages    │
+                   │  - sk-relay-xxx API key 鉴权 + 配额      │
+                   │  - bot_pool RR 调度 + 飞书消息收发       │
+                   └──────────────┬───────────────────────────┘
+                                  │ 飞书 IM REST + WS
+                                  ▼
+                          ┌───────────────────┐
+                          │  feishu-relay-bot │  ← relay_bot/ 子目录
+                          │   (内网员工机器)   │
+                          │                   │
+                          │  POST /v1/messages│
+                          └─────────┬─────────┘
+                                    │
+                                    ▼
+                            上游 LLM Provider
 ```
 
----
+bot 节点通过飞书 IM 隧道把内网 LLM 调用能力暴露给外网。Gateway 是入口 + 调度器；bot 是执行器。
 
-## 快速开始
+## 部署
 
-### 阅读 PRD
-
-按顺序看 `PRD/00 → PRD/06`，每篇约 5-10 分钟。
-
-最关键的两篇：
-
-- [02-Channel-Management.md](./PRD/02-Channel-Management.md) - 渠道管理是产品核心
-- [04-Reconciliation.md](./PRD/04-Reconciliation.md) - 双轨对账模型
-
-### 运行 Demo
-
-任意 HTTP 服务器即可，例如：
+### 启动 Gateway
 
 ```bash
-cd ModelProxy
-python3 -m http.server 8765
+pip install fastapi uvicorn httpx pyyaml pydantic
+uvicorn outside_caller.relay_server:app --host 0.0.0.0 --port 9100
 ```
 
-然后浏览器打开 <http://localhost:8765/demo/index.html>。
+### 必要环境变量
 
----
-
-## 演示路径
-
-| 路径 | 时长 | 内容 |
+| 变量 | 说明 | 默认 |
 |---|---|---|
-| A · 平台运营完整链路 | 5 min | Provider → Model 详情 → 渠道详情 (Fallback / 预算 / ACL) → 对账中心 |
-| B · 渠道运营自助经营 | 3 min | Dashboard → 新建 Key → 调用日志 (含 Fallback 路径) → 账单 |
-| C · 双轨对账故事 | 2 min | 供应商对账 (差异分析) → 渠道对账 → 利润分析 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | Gateway 用的飞书 App 凭证（注意：bot 节点用各自的 App） | `cli_xxx` / `WgV...` |
+| `RELAY_PORT` | HTTP 监听端口 | `9100` |
+| `RELAY_HOST` | 监听地址 | `0.0.0.0` |
+| `FEISHU_STATE_DIR` | 状态文件目录（含 token、bot pool、usage） | `~/.feishu_outside_caller` |
+| `POLL_INTERVAL_S` | bot 响应轮询间隔（秒） | `1.5` |
+| `POLL_TIMEOUT_S` | 单请求最长等待（秒） | `240` |
 
----
+完整字段见 [`outside_caller/config.py`](outside_caller/config.py)。
 
-## 关键设计决策
+### 首次启动
 
-| 决策 | 选型 |
-|---|---|
-| 技术底座 | 基于 New-API 二次开发 |
-| 渠道隔离 | 逻辑隔离 + 独立运营后台（子域名 / 路径） |
-| Fallback 覆盖 | 故障 + 限流 + 预算耗尽 全场景 |
-| 对账维度 | 双轨：供应商对账 (应付) + 渠道对账 (应收) |
-| 单价 | 平台侧 / 渠道侧分离，独立版本化 |
+需要先跑一次 OAuth 给 Gateway 拿飞书 user token：
 
----
+```bash
+python -m outside_caller.oauth_once
+# 浏览器走完 OAuth，token 落到 ~/.feishu_outside_caller/tokens_<app_id>.json
+```
 
-## 角色矩阵
+## API
 
-| 角色 | 工作台 | 核心权限 |
+### 客户端 API（外部 LLM SDK）
+
+| Method | Path | 说明 |
 |---|---|---|
-| 平台超管 / 运营 | Platform Admin | 管 Provider / Model / Channel / 对账 |
-| 平台财务 | Platform Admin（财务视图） | 出账 / 对账 / 退款 |
-| 渠道管理员 / 运营 | Channel Console | Key / 用量 / 账单 / 子项目 |
-| 终端开发者 | Channel Console（弱化） | 自己 Key / 用量 |
+| POST | `/v1/chat/completions` | OpenAI 风格 chat completion |
+| POST | `/v1/messages` | Anthropic 风格 messages |
+| GET | `/v1/models` | 可用模型列表 |
+| GET | `/health` | 健康检查 |
 
----
+鉴权用 `Authorization: Bearer sk-relay-xxx`，key 通过 `/admin/keys` 管理。
 
-## Demo 页面清单
+### Bot 节点 API（feishu-relay-bot 节点用）
 
-### Platform Admin (12 页)
-
-- 总览 Dashboard
-- 供应商列表 / 详情
-- 模型列表 / 详情（含通道矩阵、单价版本化）
-- 渠道列表 / 详情（7 个 Tab：基础信息 / 模型池 / Fallback / 预算 / ACL / 成员 / 用量）
-- 对账总览
-- 供应商对账（差异分析）
-- 渠道对账（争议处理）
-- 利润分析（按渠道 / 模型 / Provider 三维度）
-
-### Channel Console (10 页)
-
-- 概览 Dashboard
-- Key 管理（含限额、IP 白名单、协议白名单）
-- 子项目
-- 用量统计（多维透视）
-- 模型市场（含 Fallback 链展示）
-- 预算 / 账单（含历史使用率）
-- 调用日志（含 Fallback 路径追溯）
-- Playground（三协议切换 + 等效代码生成）
-- 团队管理
-- 设置（含自动接入文档）
-
----
-
-## 里程碑
-
-| 阶段 | 周期 | 内容 |
+| Method | Path | 说明 |
 |---|---|---|
-| M1 | 2 周 | Provider / Model / Channel CRUD + Gateway 鉴权 |
-| M2 | 4 周 | 渠道后台（New-API 改造） |
-| M3 | 4 周 | Fallback 引擎 + 预算 + ACL |
-| M4 | 3 周 | 对账中心（双轨） |
-| M5 | 持续 | 智能调度 + SLA + 独享通道 |
+| POST | `/agent/heartbeat` | bot 节点心跳上报（节点信息、模型清单、用量） |
+| POST | `/agent/offline` | bot 节点主动下线 |
+
+### Admin API（需 admin 权限的 sk-relay-xxx）
+
+| Method | Path | 说明 |
+|---|---|---|
+| GET/POST/DELETE/PATCH | `/admin/keys` | 客户端 API key 管理 |
+| GET | `/admin/keys/{key}/usage` | 单 key 用量统计 |
+| GET | `/admin/usage` | 全局用量汇总 |
+| GET | `/admin/nodes` | bot 节点列表 |
+| POST | `/admin/nodes/{node_id}/{upgrade,restart,drain}` | 单节点管控 |
+| POST | `/admin/nodes/upgrade-all` | 广播升级 |
+| GET | `/admin/dashboard` | Web 管理控制台 |
+
+## 关键模块
+
+- [`outside_caller/relay_server.py`](outside_caller/relay_server.py) — FastAPI 入口，所有 endpoint
+- [`outside_caller/bot_pool.py`](outside_caller/bot_pool.py) — bot 节点池 + RR 调度 + 飞书消息收发
+- [`outside_caller/api_keys.py`](outside_caller/api_keys.py) — 客户端 API key
+- [`outside_caller/usage.py`](outside_caller/usage.py) — 用量统计
+- [`outside_caller/rate_limit.py`](outside_caller/rate_limit.py) — RPM / daily quota
+- [`outside_caller/feishu_token.py`](outside_caller/feishu_token.py) + [`oauth_once.py`](outside_caller/oauth_once.py) — 飞书 OAuth 长 token 维护
+- [`outside_caller/relay_codec.py`](outside_caller/relay_codec.py) — 飞书消息隧道编解码（zlib 压缩）
+- [`outside_caller/models.py`](outside_caller/models.py) — 模型白名单 + endpoint 路由
+- [`outside_caller/dashboard/`](outside_caller/dashboard/) — admin 控制台前端
+
+## 当前部署
+
+生产 Gateway：`https://offer.yxzrkj.cn/llm/api`
+（阿里云杭州 `i-bp1a7ky0stlf4agxzlhn` / `47.97.3.198`）
+
+## 协议
+
+跟 bot 节点之间走 `relay_protocol v3`（详见 [`relay_bot/feishu_relay_bot/relay_protocol.py`](relay_bot/feishu_relay_bot/relay_protocol.py)）。所有消息走飞书 IM 文本隧道，超 50KB 自动 zlib 压缩；超 140KB 拆 multipart。
