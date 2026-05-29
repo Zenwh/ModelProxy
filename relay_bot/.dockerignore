@@ -16,6 +16,6 @@ DEPLOY*.md
 install.sh
 relay-bot.service
 build/
-# dist/ 里只要 3.0.0 wheel，旧 wheel/依赖 wheel 都不要进镜像
+# dist/ 里只要当前发布 wheel，旧 wheel/依赖 wheel 都不要进镜像
 dist/*
-!dist/feishu_relay_bot-3.0.0-py3-none-any.whl
+!dist/feishu_relay_bot-3.0.1-py3-none-any.whl
