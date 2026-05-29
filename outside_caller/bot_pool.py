@@ -192,7 +192,12 @@ class BotPool:
             return
         # 已知字段集合（防止旧版本字段 / 未来回滚字段炸 BotNode(**rec)）
         known = {f.name for f in BotNode.__dataclass_fields__.values()}
+        skipped = 0
         for nid, rec in data.get("nodes", {}).items():
+            # 黑名单节点不加载（清掉历史遗留的僵尸记录）
+            if nid in config.HEARTBEAT_NODE_BLOCKLIST:
+                skipped += 1
+                continue
             # 历史遗留字段清理
             for legacy in ("active_requests", "status", "heartbeats_count", "last_heartbeat_at"):
                 rec.pop(legacy, None)
@@ -200,7 +205,11 @@ class BotPool:
             rec = {k: v for k, v in rec.items() if k in known}
             self._nodes[nid] = BotNode(**rec)
         self._rr_dirty = True
-        logger.info("加载 %d 个 bot 节点", len(self._nodes))
+        if skipped:
+            logger.info("加载 %d 个 bot 节点（黑名单跳过 %d 个）", len(self._nodes), skipped)
+            self._save()  # 持久化掉被跳过的僵尸，避免下次又读到
+        else:
+            logger.info("加载 %d 个 bot 节点", len(self._nodes))
 
     def _save(self):
         os.makedirs(os.path.dirname(self._file), exist_ok=True)
@@ -244,6 +253,18 @@ class BotPool:
         node_id = payload.get("node_id")
         if not node_id:
             raise ValueError("missing node_id")
+
+        # 黑名单丢弃：返回一个未入池的临时 BotNode 让上游不至于 NameError，
+        # 但绝不调用 self._save / _rr_dirty / _nodes[node_id]= 任何写池操作。
+        if node_id in config.HEARTBEAT_NODE_BLOCKLIST:
+            logger.info("blocklist drop heartbeat from node_id=%s", node_id)
+            return BotNode(
+                node_id=node_id,
+                open_id=payload.get("open_id", ""),
+                chat_id=payload.get("chat_id", ""),
+                version=payload.get("version", ""),
+                enabled=False,
+            )
 
         def _eligibility(n: "BotNode") -> tuple:
             return (
@@ -574,7 +595,7 @@ class BotPool:
                 # v3 resp 终结即返回；流式增量 stream_chunk 在此函数里忽略（poll_stream 处理）
                 if parsed.get("_relay_v") == 3 and parsed.get("type") == "resp":
                     # 后台删除已消费消息，防止堆积拖慢后续轮询
-                    asyncio.create_task(_try_delete_message(mid))
+                    asyncio.create_task(_try_delete_message(node, mid))
                     return parsed
 
             await asyncio.sleep(interval)
@@ -908,8 +929,20 @@ def _const_time_eq(a: str, b: str) -> bool:
     return _hmac.compare_digest(a or "", b or "")
 
 
-async def _get_tenant_token() -> str:
-    """获取 tenant_access_token（用于删除 bot 自己发的消息）。"""
+async def _get_tenant_token(app_id: Optional[str] = None) -> str:
+    """获取 tenant_access_token（用于删除 bot 自己发的消息）。
+
+    多 app（xpage）路由：
+    - app_id 显式给出时，走 token_pool 拿该 app 的 token —— 这样删除的是该 app 发的消息
+    - 否则回退到全局 APP_ID/APP_SECRET（单 app 时代行为）
+    """
+    if app_id and app_id != config.APP_ID:
+        try:
+            # token_pool.auth_header returns {"Authorization": "Bearer <tok>"}
+            hdr = token_pool.auth_header(app_id)
+            return hdr["Authorization"].split(" ", 1)[1]
+        except Exception as e:
+            logger.debug("token_pool tenant for %s failed: %s; fallback to global", app_id, e)
     cli = get_http_client()
     r = await cli.post(
         f"{config.FEISHU_BASE}/open-apis/auth/v3/tenant_access_token/internal",
@@ -922,10 +955,14 @@ async def _get_tenant_token() -> str:
     return d["tenant_access_token"]
 
 
-async def _try_delete_message(message_id: str) -> None:
-    """Best-effort 删除已消费的 bot 响应消息，防止聊天窗口堆积。"""
+async def _try_delete_message(node: "BotNode", message_id: str) -> None:
+    """Best-effort 删除已消费的 bot 响应消息，防止聊天窗口堆积。
+
+    用 node 自身 app 的 tenant token 删除 —— xpage 多 app 部署下，bot 的消息是
+    bot 自己的 app 发的，必须用同一个 app 的 token 才有权限删除，否则 403。
+    """
     try:
-        token = await _get_tenant_token()
+        token = await _get_tenant_token(node.app_id or None)
         cli = get_http_client()
         r = await cli.delete(
             f"{config.FEISHU_BASE}/open-apis/im/v1/messages/{message_id}",

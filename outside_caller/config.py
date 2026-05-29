@@ -89,6 +89,12 @@ STREAM_BUFFER_FLUSH_MS = int(os.getenv("STREAM_BUFFER_FLUSH_MS", "1000"))
 BOOTSTRAP_TOKEN = os.getenv("BOOTSTRAP_TOKEN", "")
 CLUSTER_HEARTBEAT_INTERVAL_S = int(os.getenv("CLUSTER_HEARTBEAT_INTERVAL_S", "30"))
 
+# 心跳黑名单：逗号分隔的 node_id 集合，匹配的心跳直接丢弃且不入池。
+# 用于隔离无法直接 stop 的僵尸节点（如老 v0.2.x 内网机器，IM 隧道仍能注册）。
+HEARTBEAT_NODE_BLOCKLIST = frozenset(
+    s.strip() for s in os.getenv("HEARTBEAT_NODE_BLOCKLIST", "").split(",") if s.strip()
+)
+
 
 # ---- Atomic JSON write helper --------------------------------------------------
 
